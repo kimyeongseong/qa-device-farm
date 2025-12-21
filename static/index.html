@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QA Device Farm</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #050505;
+            --card-bg: rgba(20, 20, 23, 0.4);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --text-primary: #f4f4f5;
+            --text-secondary: #a1a1aa;
+            --accent-color: #6366f1;
+            --accent-glow: rgba(99, 102, 241, 0.6);
+            --success-color: #10b981;
+            --cyan-glow: rgba(6, 182, 212, 0.5);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            font-family: 'Inter', 'Pretendard', 'Malgun Gothic', sans-serif;
+            /* Added Korean fonts */
+            margin: 0;
+            padding: 40px;
+            min-height: 100vh;
+            overflow-x: hidden;
+            overflow-y: scroll;
+            cursor: default;
+        }
+
+        /* Canvas Background */
+        #bg-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -2;
+            background: radial-gradient(circle at center, #0B0B0E 0%, #000 100%);
+        }
+
+        /* Cursor Glow Follower */
+        #cursor-glow {
+            position: fixed;
+            width: 800px;
+            height: 800px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(99, 102, 241, 0.08) 0%, transparent 60%);
+            pointer-events: none;
+            z-index: -1;
+            transform: translate(-50%, -50%);
+            transition: opacity 0.3s;
+            mix-blend-mode: screen;
+        }
+
+        .tech-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 50px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 20px;
+            backdrop-filter: blur(5px);
+            position: relative;
+            z-index: 10;
+        }
+
+        h1 {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 800;
+            font-size: 2.5rem;
+            margin: 0;
+            color: white;
+            letter-spacing: -2px;
+            text-shadow: 0 0 10px rgba(255, 255, 255, 0.3);
+            display: flex;
+            align-items: center;
+        }
+
+        .cursor-blink {
+            display: inline-block;
+            width: 15px;
+            height: 35px;
+            background: var(--accent-color);
+            margin-left: 10px;
+            animation: blink 1s step-end infinite;
+        }
+
+        @keyframes blink {
+            50% {
+                opacity: 0;
+            }
+        }
+
+        .system-status {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            color: var(--success-color);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: rgba(16, 185, 129, 0.05);
+            padding: 8px 16px;
+            border-radius: 4px;
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            box-shadow: 0 0 15px rgba(16, 185, 129, 0.1);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--success-color);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--success-color);
+            animation: pulseDot 2s infinite;
+        }
+
+        @keyframes pulseDot {
+            0% {
+                opacity: 1;
+                box-shadow: 0 0 5px var(--success-color);
+            }
+
+            50% {
+                opacity: 0.5;
+                box-shadow: 0 0 20px var(--success-color);
+            }
+
+            100% {
+                opacity: 1;
+                box-shadow: 0 0 5px var(--success-color);
+            }
+        }
+
+        .device-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 30px;
+            z-index: 1;
+            position: relative;
+        }
+
+        .device-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 24px;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            position: relative;
+            backdrop-filter: blur(16px);
+            overflow: hidden;
+        }
+
+        .device-card::after {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 5px;
+            background: rgba(255, 255, 255, 0.1);
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .device-card:hover::after {
+            animation: scanline 2s linear infinite;
+            opacity: 1;
+        }
+
+        @keyframes scanline {
+            0% {
+                top: -10%;
+            }
+
+            100% {
+                top: 110%;
+            }
+        }
+
+        .device-card:hover {
+            transform: translateY(-8px) scale(1.02);
+            box-shadow: 0 20px 40px -5px rgba(0, 0, 0, 0.8), 0 0 30px rgba(99, 102, 241, 0.15);
+            border-color: rgba(99, 102, 241, 0.5);
+        }
+
+        .device-thumb {
+            width: 100%;
+            height: 380px;
+            object-fit: contain;
+            background: #000;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            cursor: pointer;
+            transition: opacity 0.3s;
+            border: 1px solid #222;
+        }
+
+        .card-header {
+            font-family: 'JetBrains Mono', 'Malgun Gothic', monospace;
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 5px;
+            letter-spacing: -0.5px;
+        }
+
+        .btn {
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 700;
+            transition: all 0.2s;
+            text-transform: uppercase;
+            font-size: 0.85rem;
+            letter-spacing: 0;
+            /* Reduced for Korean */
+            font-family: 'JetBrains Mono', 'Malgun Gothic', monospace;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn-manage {
+            background: #0f0f11;
+            color: #fff;
+            padding: 16px;
+            width: 100%;
+            margin-top: 20px;
+            border: 1px solid #333;
+            z-index: 1;
+        }
+
+        .btn-manage::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+            transition: 0.5s;
+            z-index: -1;
+        }
+
+        .btn-manage:hover::before {
+            left: 100%;
+        }
+
+        .btn-manage:hover {
+            border-color: var(--accent-color);
+            color: var(--accent-color);
+            box-shadow: 0 0 15px var(--accent-glow);
+            text-shadow: 2px 0 var(--danger-color), -2px 0 var(--cyan-glow);
+        }
+
+        .btn-delete {
+            background: transparent;
+            color: #ef4444;
+            padding: 4px 10px;
+            font-size: 0.75rem;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+
+        .btn-delete:hover {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: #ef4444;
+        }
+
+        /* Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            backdrop-filter: blur(20px);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal {
+            background: #08080a;
+            padding: 30px;
+            border-radius: 12px;
+            width: 600px;
+            border: 1px solid #333;
+            box-shadow: 0 0 50px rgba(0, 0, 0, 0.8);
+        }
+
+        .tab-btn {
+            background: transparent;
+            border: none;
+            color: #555;
+            padding: 10px 20px;
+            cursor: pointer;
+            border-bottom: 2px solid #222;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', 'Malgun Gothic';
+            transition: 0.3s;
+        }
+
+        .tab-btn.active {
+            color: #fff;
+            border-bottom-color: var(--accent-color);
+            text-shadow: 0 0 10px var(--accent-color);
+        }
+
+        .tab-content {
+            display: none;
+            padding-top: 20px;
+            height: 500px;
+            overflow-y: auto;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .pkg-item {
+            padding: 8px;
+            border-bottom: 1px solid #222;
+            color: #aaa;
+            font-family: 'JetBrains Mono', 'Malgun Gothic';
+            font-size: 0.85em;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        ::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #000;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Background FX -->
+    <canvas id="bg-canvas"></canvas>
+    <div id="cursor-glow"></div>
+
+    <div class="tech-header">
+        <div>
+            <h1 id="mainTitle">QA DEVICE FARM <div class="cursor-blink"></div>
+            </h1>
+            <div style="font-size:0.8em; color:#666; font-family:'JetBrains Mono'; margin-top:5px; letter-spacing:1px;">
+                MANAGED BY QA TEAM</div>
+        </div>
+        <div class="system-status">
+            <div class="status-dot"></div>
+            시스템 정상 가동
+        </div>
+    </div>
+
+    <!-- Details Modal -->
+    <div id="manageModal" class="modal-overlay">
+        <div class="modal">
+            <span class="close-btn" style="float:right; cursor:pointer; color:#fff; font-size:1.5em;"
+                onclick="closeModal()">×</span>
+            <h2 id="modalTitle" style="color:white; margin-top:0; font-family:'JetBrains Mono';">설정</h2>
+            <div style="display:flex; gap:0; margin-bottom:20px;">
+                <button class="tab-btn active" onclick="switchTab('info')" id="tab-info">시스템 정보</button>
+                <button class="tab-btn" onclick="switchTab('apps')" id="tab-apps">앱 관리</button>
+                <!-- <button class="tab-btn" id="tab-macros" onclick="switchTab('macros')">매크로 (Beta)</button> -->
+            </div>
+            <div id="info-content" class="tab-content active"></div>
+            <div id="apps-content" class="tab-content"></div>
+            <div id="macros-content" class="tab-content"></div>
+        </div>
+    </div>
+
+    <div class="device-grid" id="device-container">
+        <!-- Devices injected here -->
+        <div class="empty-msg"
+            style="grid-column: 1/-1; text-align: center; padding: 100px; color: #333; font-family:'JetBrains Mono';">
+            [ 기기 연결 대기 중... ]
+        </div>
+    </div>
+
+    <script>
+        // --- ADVANCED FX SYSTEM ---
+        const canvas = document.getElementById('bg-canvas');
+        const ctx = canvas.getContext('2d');
+        const glow = document.getElementById('cursor-glow');
+
+        let width, height;
+        let particles = [];
+        let ripples = [];
+        let mouse = { x: -9999, y: -9999 };
+
+        // Hacking Text Effect (Modified for Branding)
+        const titleElement = document.getElementById('mainTitle');
+        const finalTitle = "QA DEVICE FARM";
+        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%^&*";
+
+        function hackTextEffect() {
+            let iterations = 0;
+            const interval = setInterval(() => {
+                titleElement.innerText = finalTitle.split("").map((letter, index) => {
+                    if (index < iterations) return letter;
+                    return chars[Math.floor(Math.random() * chars.length)];
+                }).join("");
+
+                titleElement.innerHTML += ' <div class="cursor-blink"></div>';
+
+                if (iterations >= finalTitle.length) clearInterval(interval);
+                iterations += 1 / 2;
+            }, 30);
+        }
+        window.onload = hackTextEffect;
+
+        function resize() {
+            width = canvas.width = window.innerWidth;
+            height = canvas.height = window.innerHeight;
+            initParticles();
+        }
+        window.addEventListener('resize', resize);
+
+        document.addEventListener('mousemove', (e) => {
+            mouse.x = e.clientX;
+            mouse.y = e.clientY;
+            glow.style.left = e.clientX + 'px';
+            glow.style.top = e.clientY + 'px';
+        });
+
+        document.addEventListener('mousedown', (e) => {
+            ripples.push({
+                x: e.clientX, y: e.clientY,
+                radius: 0, opacity: 1,
+                color: 'rgba(99, 102, 241, '
+            });
+        });
+
+        class Particle {
+            constructor() {
+                this.x = Math.random() * width;
+                this.y = Math.random() * height;
+                this.vx = (Math.random() - 0.5) * 0.8;
+                this.vy = (Math.random() - 0.5) * 0.8;
+                this.size = Math.random() * 2 + 0.5;
+            }
+            update() {
+                this.x += this.vx; this.y += this.vy;
+                if (this.x < 0 || this.x > width) this.vx *= -1;
+                if (this.y < 0 || this.y > height) this.vy *= -1;
+
+                const dx = mouse.x - this.x;
+                const dy = mouse.y - this.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+
+                if (dist < 200) {
+                    ctx.beginPath();
+                    ctx.strokeStyle = `rgba(100, 200, 255, ${1 - dist / 200})`;
+                    ctx.lineWidth = 0.5;
+                    ctx.moveTo(this.x, this.y);
+                    ctx.lineTo(mouse.x, mouse.y);
+                    ctx.stroke();
+                }
+            }
+            draw() {
+                ctx.beginPath();
+                ctx.fillStyle = 'rgba(255,255,255,0.4)';
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        function initParticles() {
+            particles = [];
+            const count = Math.floor(width * height / 12000);
+            for (let i = 0; i < count; i++) particles.push(new Particle());
+        }
+
+        function animate() {
+            ctx.clearRect(0, 0, width, height);
+            particles.forEach(p => { p.update(); p.draw(); });
+            ripples.forEach((r, index) => {
+                r.radius += 5;
+                r.opacity -= 0.02;
+                ctx.beginPath();
+                ctx.strokeStyle = r.color + r.opacity + ')';
+                ctx.lineWidth = 2;
+                ctx.arc(r.x, r.y, r.radius, 0, Math.PI * 2);
+                ctx.stroke();
+                if (r.opacity <= 0) ripples.splice(index, 1);
+            });
+            requestAnimationFrame(animate);
+        }
+        resize();
+        animate();
+
+
+        // --- LOGIC SYSTEM ---
+        let currentSerial = '';
+        async function fetchDevices() {
+            try {
+                const res = await fetch('/api/devices');
+                const data = await res.json();
+                if (data.devices) renderDevices(data.devices);
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        // Who currently holds the device, and for how much longer.
+        function leaseBadge(dev) {
+            if (!dev.occupied_by) {
+                return `<span style="color:var(--success-color);">● IDLE</span>`;
+            }
+            const left = Math.max(0, Math.round((dev.occupied_until - Date.now() / 1000) / 60));
+            return `<span style="color:#ffb454;" title="점유 중">🔒 ${dev.occupied_by} <span style="color:#666;">${left}m</span></span>`;
+        }
+
+        function renderDevices(devices) {
+            const container = document.getElementById('device-container');
+            const currentSerials = new Set(devices.map(d => d.serial));
+
+            document.querySelectorAll('.device-card').forEach(card => {
+                const serial = card.id.replace('card-', '');
+                if (!currentSerials.has(serial)) card.remove();
+            });
+
+            if (devices.length === 0 && container.children.length === 0) {
+                container.innerHTML = `<div class='empty-msg' style='grid-column:1/-1; text-align:center; padding:50px; color:#555;'>[ 시스템 스캔 중... USB 연결을 확인하세요 ]</div>`;
+                return;
+            } else {
+                const e = container.querySelector('.empty-msg');
+                if (e) e.remove();
+            }
+
+            devices.forEach((dev, index) => {
+                let card = document.getElementById(`card-${dev.serial}`);
+                const ts = new Date().getTime();
+
+                // Audio State
+                const isAudio = window[`audio_${dev.serial}`];
+                const audioColor = isAudio ? 'var(--danger-color)' : '#444'; // Grey when off, Red when on (stop)
+                const audioText = isAudio ? '🔇 STOP' : '🔊 SOUND';
+
+                // Alias Logic
+                const displayName = (dev.alias && dev.alias !== dev.model) ? `${dev.alias} <span style='font-size:0.7em; color:#666;'>(${dev.model})</span>` : dev.model;
+
+                if (card) {
+                    const img = card.querySelector('.device-thumb');
+                    const newImg = new Image();
+                    newImg.onload = () => { img.src = newImg.src; };
+                    newImg.src = `/api/device/${dev.serial}/screenshot?t=${ts}`;
+                    const battery = card.querySelector('.battery-info');
+                    if (battery) battery.innerText = `${dev.battery || '?'}`;
+                    const lease = card.querySelector('.lease-info');
+                    if (lease) lease.innerHTML = leaseBadge(dev);
+
+                    // Update Title
+                    const header = card.querySelector('.card-header');
+                    if (header) header.innerHTML = `${displayName} <span onclick="editAlias('${dev.serial}', '${dev.alias || dev.model}')" style="cursor:pointer; font-size:0.8em; margin-left:5px;">✏️</span>`;
+
+                    // Update Audio Button
+                    const audioBtn = card.querySelector('.btn-audio');
+                    if (audioBtn) {
+                        audioBtn.style.color = isAudio ? '#ff5555' : '#888';
+                        audioBtn.innerText = audioText;
+                        audioBtn.style.borderColor = isAudio ? '#ff5555' : '#333';
+                    }
+
+                } else {
+                    card = document.createElement('div');
+                    card.className = 'device-card';
+                    card.id = `card-${dev.serial}`;
+                    card.setAttribute('ondrop', `dropHandler(event, '${dev.serial}')`);
+                    card.setAttribute('ondragover', 'dragOverHandler(event)');
+                    card.innerHTML = `
+                         <div style="position:relative;">
+                             <div style="position:absolute; top:5px; left:5px; background:rgba(0,0,0,0.7); color:#0f0; padding:2px 6px; font-size:0.8em; border-radius:4px; border:1px solid #0f0; z-index:10;">No.${index + 1}</div>
+                             <img class="device-thumb" src="/api/device/${dev.serial}/screenshot" onclick="openControl('${dev.serial}', '${dev.model}')">
+                        </div>
+                        <div class="card-header">
+                            ${displayName} <span onclick="editAlias('${dev.serial}', '${dev.alias || dev.model}')" style="cursor:pointer; font-size:0.8em; margin-left:5px;">✏️</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; margin-bottom:8px; font-size:0.9em; color:#888; font-family:'JetBrains Mono';">
+                            <span onclick="copySerial('${dev.serial}')" style="cursor:pointer;" title="복사하려면 클릭">${dev.serial}</span>
+                            <span class="battery-info" style="color:${(dev.battery === '100%') ? 'var(--success-color)' : '#aaa'}">${dev.battery}</span>
+                        </div>
+                        <div class="lease-info" style="margin-bottom:15px; font-size:0.8em; font-family:'JetBrains Mono';">${leaseBadge(dev)}</div>
+                        <button class="btn btn-manage" onclick="openManage('${dev.serial}', '${dev.model}')">⚙️ 시스템 관리 (앱)</button>
+                    `;
+                    container.appendChild(card);
+                }
+            });
+        }
+
+        function copySerial(txt) { navigator.clipboard.writeText(txt); alert('시리얼 번호가 복사되었습니다: ' + txt); }
+        function openControl(serial, model = 'Device') {
+            // Open the Custom Wrapper Page (Stream + Audio)
+            const url = `/static/stream.html?serial=${serial}&model=${encodeURIComponent(model)}`;
+            window.open(url, '_blank', 'width=500,height=850,location=no,status=no,resizable=yes');
+        }
+
+        function openManage(serial, model) {
+            currentSerial = serial;
+            document.getElementById('manageModal').style.display = 'flex';
+            document.getElementById('modalTitle').innerText = `[${model}] 환경 설정`;
+            switchTab('info');
+        }
+        function closeModal() { document.getElementById('manageModal').style.display = 'none'; }
+
+        function switchTab(t) {
+            document.querySelectorAll('.tab-content').forEach(e => e.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(e => e.classList.remove('active'));
+            document.getElementById(`${t}-content`).classList.add('active');
+            document.getElementById(`tab-${t}`).classList.add('active');
+            if (t === 'info') loadInfo();
+            if (t === 'apps') loadApps();
+            if (t === 'macros') loadMacros();
+        }
+
+        async function loadInfo() {
+            const div = document.getElementById('info-content');
+            div.innerHTML = '스캔 중...';
+            const res = await fetch(`/api/info/${currentSerial}`);
+            const data = await res.json();
+            if (data.status === 'success') {
+                const i = data.info;
+                div.innerHTML = `
+                <div style="background:#111; padding:20px; border-radius:4px; border:1px solid #333; font-family:'JetBrains Mono', 'Malgun Gothic';">
+                    <div style="color:var(--accent-color); margin-bottom:10px;">>> 시스템 상세 정보</div>
+                    <div>모델명: ${i.model}</div>
+                    <div>OS 버전: Android ${i.android_version} (SDK ${i.sdk})</div>
+                    <div>IP 주소: ${i.ip}</div>
+                    <div style="color:#666; font-size:0.9em; margin-top:10px;">UID: ${i.serial}</div>
+                </div>
+                <button class="btn btn-manage" style="margin-top:20px;" onclick="toggleWireless()">>> 무선 연결 (TCP/IP)</button>
+                `;
+            }
+        }
+
+        async function editAlias(serial, current) {
+            const newName = prompt("이 기기의 새로운 이름을 입력하세요:\n(빈칸으로 두면 원래 모델명으로 초기화됩니다)", current === 'undefined' ? '' : current);
+            if (newName === null) return; // Cancelled
+
+            try {
+                const res = await fetch(`/api/alias/${serial}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName })
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    fetchDevices(); // Refresh immediately
+                } else {
+                    alert('변경 실패: ' + (data.message || 'Unknown error'));
+                }
+            } catch (e) {
+                console.error(e);
+                alert('통신 오류');
+            }
+        }
+
+        async function toggleAudio() {
+            const isPlaying = window[`audio_${currentSerial} `];
+
+            if (!isPlaying) {
+                // START
+                if (!confirm("PC 스피커로 소리를 재생합니다.\n(작은 오디오 창이 뜹니다. 닫지 마세요!)")) return;
+                const res = await fetch(`/ api / audio / start / ${currentSerial} `, { method: 'POST' });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    window[`audio_${currentSerial} `] = true;
+                    alert("오디오 ON! 🔊");
+                } else alert("오류: " + data.message);
+            } else {
+                // STOP
+                const res = await fetch(`/ api / audio / stop / ${currentSerial} `, { method: 'POST' });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    window[`audio_${currentSerial} `] = false;
+                    alert("오디오 OFF! 🔇");
+                } else alert("오류: " + data.message);
+            }
+            loadInfo(); // Refresh UI
+        }
+        async function loadApps() {
+            const div = document.getElementById('apps-content');
+            div.innerHTML = '패키지 목록 불러오는 중...';
+            const res = await fetch(`/ api / packages / ${currentSerial} `);
+            const data = await res.json();
+            div.innerHTML = '';
+            if (data.packages) {
+                data.packages.forEach(p => {
+                    const r = document.createElement('div');
+                    r.className = 'pkg-item';
+                    r.innerHTML = `< span > ${p}</span > <button class="btn btn-delete" onclick="uninstall('${p}')">삭제</button>`;
+                    div.appendChild(r);
+                });
+            }
+        }
+        async function loadMacros() {
+            const div = document.getElementById('macros-content');
+            div.innerHTML = '매크로 DB 로딩 중...';
+            const res = await fetch('/api/macros');
+            const data = await res.json();
+            div.innerHTML = '';
+            if (data.macros.length === 0) div.innerHTML = "저장된 매크로가 없습니다.";
+            data.macros.forEach(m => {
+                const r = document.createElement('div');
+                r.className = 'pkg-item';
+                r.innerHTML = `< span > ${m}</span > <div><button class="btn btn-delete" style="color:white; border-color:#555;" onclick="playMacro('${m}')">실행</button></div>`;
+                div.appendChild(r);
+            });
+        }
+        async function uninstall(pkg) { if (!confirm(pkg + ' 앱을 삭제하시겠습니까?')) return; await fetch(`/ api / uninstall / ${currentSerial} `, { method: 'POST', body: JSON.stringify({ package: pkg }) }); loadApps(); }
+        async function playMacro(name) { if (!confirm(name + ' 매크로를 실행하시겠습니까?')) return; await fetch(`/ api / macros / play / ${currentSerial} `, { method: 'POST', body: JSON.stringify({ name: name }) }); }
+        async function toggleWireless() { await fetch(`/ api / wireless / ${currentSerial} `, { method: 'POST' }); alert('무선 연결 명령을 전송했습니다. 케이블 분리 전 로그를 확인하세요.'); }
+        function dragOverHandler(ev) { ev.preventDefault(); ev.dataTransfer.dropEffect = "copy"; }
+        function dropHandler(ev, serial) { ev.preventDefault(); if (ev.dataTransfer.items) { [...ev.dataTransfer.items].forEach((item) => { if (item.kind === 'file') { const file = item.getAsFile(); if (file.name.endsWith('.apk')) uploadApk(file, serial); } }); } }
+        async function uploadApk(file, serial) { alert(file.name + ' 설치를 시작합니다...'); const fd = new FormData(); fd.append('file', file); await fetch(`/ api / install / ${serial}`, { method: 'POST', body: fd }); alert('설치가 완료되었습니다.'); }
+
+        fetchDevices();
+        setInterval(fetchDevices, 2000);
+    </script>
+</body>
+
+</html>

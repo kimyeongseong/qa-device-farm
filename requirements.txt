@@ -1,0 +1,13 @@
+# Web server
+fastapi
+uvicorn
+websockets          # uvicorn's WebSocket implementation (video + control sockets)
+python-multipart    # required by FastAPI for the APK upload endpoint
+pydantic
+
+# Device control
+adbutils
+Pillow              # screenshot resize / JPEG encode in /api/device/{serial}/screenshot
+
+# CLI client (cli.py)
+requests

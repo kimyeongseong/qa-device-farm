@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Device Controller</title>
+    <!-- Use CDN for MVP -->
+    <script type="text/javascript" src="https://unpkg.com/jmuxer/dist/jmuxer.min.js"></script>
+    <style>
+        body {
+            background-color: #121212;
+            color: #e0e0e0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            height: 100vh;
+            font-family: 'Segoe UI', sans-serif;
+        }
+
+        #header {
+            width: 100%;
+            padding: 10px 20px;
+            background: #1e1e1e;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        #video-container {
+            margin-top: 20px;
+            border: 2px solid #333;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+            line-height: 0;
+            /* Removing bottom gap */
+        }
+
+        video {
+            background: #000;
+            max-height: 80vh;
+            max-width: 100%;
+        }
+
+        .btn {
+            background: #bb86fc;
+            color: #000;
+            border: none;
+            padding: 8px 16px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="header">
+        <span id="device-id">Connecting...</span>
+        <div>
+            <button id="btn-record" class="btn" style="background:#cf6679; margin-right:10px;"
+                onclick="toggleRecord()">🔴 Rec</button>
+            <button class="btn" onclick="location.href='/'">Go Back</button>
+        </div>
+    </div>
+
+    <div id="video-container">
+        <video id="player" autoplay muted></video>
+    </div>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const serial = urlParams.get('serial');
+        const model = urlParams.get('model');
+        document.title = `${model} [${serial}]`;
+        document.getElementById('device-id').textContent = `Device: ${serial}`;
+
+        // Initialize JMuxer
+        const jmuxer = new JMuxer({
+            node: 'player',
+            mode: 'video',
+            flushingTime: 0,
+            fps: 60,
+            debug: false
+        });
+
+        // Dynamic Protocol Selection (WS vs WSS)
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.host;
+
+        // Connect to Python Server Video WebSocket
+        const ws = new WebSocket(`${protocol}//${host}/ws/video/${serial}`);
+
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+            console.log('Video WS Connected');
+        };
+
+        ws.onmessage = (event) => {
+            jmuxer.feed({
+                video: new Uint8Array(event.data)
+            });
+        };
+
+        ws.onerror = (e) => console.error('WS Error:', e);
+
+        // --- Control Logic ---
+        const controlWs = new WebSocket(`${protocol}//${host}/ws/control/${serial}`);
+
+        const videoElement = document.getElementById('player');
+
+        // Mouse Events
+        videoElement.addEventListener('mousedown', (e) => {
+            const rect = videoElement.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            const scaleX = videoElement.videoWidth / videoElement.offsetWidth;
+            const scaleY = videoElement.videoHeight / videoElement.offsetHeight;
+
+            controlWs.send(JSON.stringify({
+                type: 'tap',
+                x: Math.round(x * scaleX),
+                y: Math.round(y * scaleY)
+            }));
+        });
+
+        // --- Macro Functions ---
+        let isRecording = false;
+        async function toggleRecord() {
+            const btn = document.getElementById('btn-record');
+            if (!isRecording) {
+                if (!confirm("Start Recording?")) return;
+                await fetch(`/api/macros/start_record/${serial}`, { method: 'POST' });
+                isRecording = true;
+                btn.innerText = "⏹ Stop";
+                btn.style.background = "#ff0000";
+            } else {
+                const name = prompt("Macro Name:") || `macro_${Date.now()}`;
+                const res = await fetch(`/api/macros/stop_record/${serial}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name })
+                });
+                const data = await res.json();
+                alert(`Saved: ${name}`);
+                isRecording = false;
+                btn.innerText = "🔴 Rec";
+                btn.style.background = "#cf6679";
+            }
+        }
+    </script>
+</body>
+
+</html>

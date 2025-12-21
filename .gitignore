@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# ws-scrcpy build output
+ws-scrcpy/dist/
+ws-scrcpy/build/
+
+# Local runtime state (device serials, recorded macros, uploads)
+device_aliases.json
+macros/*.json
+temp_*.apk
+screenshots/
+scrcpy_bin/
+*.log
+
+# Local deployment config (tunnel hostnames)
+static/stream-config.js
+
+# Captured device logs -- never commit, they carry app and account data
+raw_logs.txt
+crash.txt
+*crash*.txt
+logcat*.txt
+
+# Archives
+*.zip
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

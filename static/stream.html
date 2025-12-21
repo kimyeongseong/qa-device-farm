@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Device Stream & Audio</title>
+    <!-- Optional: copy stream-config.example.js to stream-config.js to set a tunnel host -->
+    <script src="/static/stream-config.js" onerror="void 0"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            color: #fff;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        #toolbar {
+            height: 50px;
+            background: #111;
+            border-bottom: 1px solid #333;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 15px;
+        }
+
+        #stream-frame {
+            flex: 1;
+            border: none;
+            width: 100%;
+        }
+
+        .btn {
+            background: #222;
+            border: 1px solid #444;
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: monospace;
+            font-weight: bold;
+        }
+
+        .btn.active {
+            background: #d32f2f;
+            border-color: #f44336;
+            color: white;
+        }
+
+        .status {
+            font-size: 0.8rem;
+            color: #888;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="toolbar">
+        <div style="display:flex; align-items:center;">
+            <span style="font-weight:bold; color:var(--accent); margin-right:10px;">STREAM</span>
+            <span id="dev-serial" class="status"></span>
+        </div>
+        <div>
+            <button id="audio-btn" class="btn" onclick="toggleAudio()">🔊 AUDIO</button>
+        </div>
+    </div>
+    <iframe id="stream-frame" src=""></iframe>
+
+    <script>
+        const params = new URLSearchParams(window.location.search);
+        const serial = params.get('serial');
+        const model = params.get('model') || 'Device';
+
+        document.title = `${model} [${serial}]`;
+        document.getElementById('dev-serial').innerText = serial;
+
+        // Decoder State: Fixed to MSE (Default)
+
+        // The stream server (ws-scrcpy, port 8000) sits behind its own tunnel when
+        // the farm is exposed publicly, so it needs a hostname of its own. Set it
+        // in static/stream-config.js; without that file we stay on the LAN path.
+        const TUNNEL = (window.STREAM_TUNNEL_HOST || '').trim();
+
+        function loadStream() {
+            let host = window.location.hostname;
+            let port = 8000;
+            let wsProto = 'ws:';
+            let httpProto = 'http:';
+
+            // Tunneled access (localtunnel, Cloudflare Quick Tunnel, ...)
+            if (TUNNEL && window.location.protocol === 'https:') {
+                host = TUNNEL;
+                port = 443;
+                wsProto = 'wss:';
+                httpProto = 'https:';
+            }
+
+            // Construct URLs
+            // For WS Proxy: ws://${host}:${port}/...
+            const wsUrl = `${wsProto}//${host}:${port}/?action=proxy-adb&remote=tcp:8886&udid=${serial}`;
+
+            // For Stream Page (Player): http://${host}:${port}/...
+            // Note: If using tunneling, the player page itself (index.js inside ws-scrcpy) also needs to be accessed.
+            // But here we are setting the src of the iframe.
+            const targetUrl = `${httpProto}//${host}:${port}/#!action=stream&udid=${serial}&player=mse&ws=${encodeURIComponent(wsUrl)}`;
+
+            document.getElementById('stream-frame').src = targetUrl;
+        }
+
+        // Initial Load
+        loadStream();
+
+        let isAudioOn = false;
+
+        async function toggleAudio() {
+            const btn = document.getElementById('audio-btn');
+            if (!isAudioOn) {
+                // Start
+                try {
+                    const res = await fetch(`/api/audio/start/${serial}`, { method: 'POST' });
+                    const data = await res.json();
+                    if (data.status === 'success' || data.message.includes('already')) {
+                        isAudioOn = true;
+                        btn.innerText = "🔇 AUDIO OFF";
+                        btn.classList.add('active');
+                    } else {
+                        alert("Audio failed: " + data.message);
+                    }
+                } catch (e) { console.error(e); }
+            } else {
+                // Stop
+                try {
+                    await fetch(`/api/audio/stop/${serial}`, { method: 'POST' });
+                    isAudioOn = false;
+                    btn.innerText = "🔊 AUDIO ON";
+                    btn.classList.remove('active');
+                } catch (e) { console.error(e); }
+            }
+        }
+
+        // Cleanup on close
+        window.addEventListener('beforeunload', () => {
+            // Use sendBeacon for reliable request on unload, or just regular fetch (best effort)
+            // navigator.sendBeacon(`/api/audio/stop/${serial}`); // Beacon sends POST
+            // But our API expects empty body, which beacon handles fine.
+            // Fallback to fetch keepalive if supported or just sync xhr (deprecated)
+            fetch(`/api/audio/stop/${serial}`, { method: 'POST', keepalive: true });
+        });
+    </script>
+</body>
+
+</html>
