@@ -14,11 +14,19 @@ what a pipeline wants: ask for an Android, get one, run, hand it back.
 
 import argparse
 import json
+import os
 import sys
 
 import requests
 
 DEFAULT_BASE = "http://localhost:8001"
+
+
+def split_serials(raw):
+    serials = [s.strip() for s in raw.split(",") if s.strip()]
+    if not serials:
+        sys.exit("--serials is empty")
+    return serials
 
 
 def call(base, method, path, payload=None):
@@ -35,8 +43,9 @@ def call(base, method, path, payload=None):
 
     print(json.dumps(body, indent=2, ensure_ascii=False))
     # A held device (409) is a normal pipeline outcome, so report it as failure
-    # without a stack trace.
-    if not resp.ok:
+    # without a stack trace. A batch that only partly succeeded answers 200 but
+    # is still a failed step as far as CI is concerned.
+    if not resp.ok or (isinstance(body, dict) and body.get("status") == "partial"):
         sys.exit(1)
     return body
 
@@ -88,6 +97,44 @@ def main():
     shot.add_argument("--serial", required=True)
     shot.add_argument("--out", default="screenshot.jpg")
 
+    appc = sub.add_parser("app", help="launch / stop / clear an app")
+    appc.add_argument("--serial", required=True)
+    appc.add_argument("--action", required=True, choices=["launch", "stop", "clear"])
+    appc.add_argument("--package", required=True)
+    appc.add_argument("--owner")
+
+    macros = sub.add_parser("macros", help="list saved macros")
+
+    macrm = sub.add_parser("macro-delete")
+    macrm.add_argument("--name", required=True)
+
+    log = sub.add_parser("logcat", help="capture device logs")
+    log.add_argument("action", choices=["start", "stop", "tail", "save", "status"])
+    log.add_argument("--serial")
+    log.add_argument("--level", default="V", choices=["V", "D", "I", "W", "E", "F"])
+    log.add_argument("--contains", help="only lines containing this text")
+    log.add_argument("--lines", type=int, default=200)
+    log.add_argument("--out", default=None, help="file for `save` (default logcat_<serial>.txt)")
+    log.add_argument("--owner")
+
+    # Batch verbs take --serials as a comma-separated list.
+    bapp = sub.add_parser("batch-app")
+    bapp.add_argument("--serials", required=True)
+    bapp.add_argument("--action", required=True, choices=["launch", "stop", "clear"])
+    bapp.add_argument("--package", required=True)
+    bapp.add_argument("--owner")
+
+    bmac = sub.add_parser("batch-macro")
+    bmac.add_argument("--serials", required=True)
+    bmac.add_argument("--name", required=True)
+    bmac.add_argument("--count", type=int, default=1)
+    bmac.add_argument("--owner")
+
+    bins = sub.add_parser("batch-install")
+    bins.add_argument("--serials", required=True)
+    bins.add_argument("--apk", required=True)
+    bins.add_argument("--owner")
+
     a = p.parse_args()
 
     if a.cmd == "devices":
@@ -114,6 +161,83 @@ def main():
             f.write(resp.content)
         print(a.out)
         return None
+
+    if a.cmd == "app":
+        body = {"package": a.package}
+        if a.owner:
+            body["owner"] = a.owner
+        return call(a.base, "POST", f"/api/app/{a.serial}/{a.action}", body)
+
+    if a.cmd == "macros":
+        return call(a.base, "GET", "/api/macros")
+
+    if a.cmd == "macro-delete":
+        return call(a.base, "DELETE", f"/api/macros/{a.name}")
+
+    if a.cmd == "logcat":
+        if a.action == "status":
+            return call(a.base, "GET", "/api/logcat")
+        if not a.serial:
+            sys.exit("logcat %s needs --serial" % a.action)
+        if a.action == "start":
+            body = {"clear": True, "level": a.level}
+            if a.owner:
+                body["owner"] = a.owner
+            return call(a.base, "POST", f"/api/logcat/{a.serial}/start", body)
+        if a.action == "stop":
+            return call(a.base, "POST", f"/api/logcat/{a.serial}/stop", {})
+        if a.action == "save":
+            resp = requests.get(f"{a.base}/api/logcat/{a.serial}/download", timeout=60)
+            if not resp.ok:
+                sys.exit(f"download failed: {resp.status_code} {resp.text[:200]}")
+            out = a.out or f"logcat_{a.serial}.txt"
+            with open(out, "wb") as f:
+                f.write(resp.content)
+            print(out)
+            return None
+        # tail: print the log itself rather than a JSON blob, and make a crash
+        # fail the step so CI notices without anyone reading the output.
+        params = {"tail": a.lines}
+        if a.contains:
+            params["contains"] = a.contains
+        resp = requests.get(f"{a.base}/api/logcat/{a.serial}", params=params, timeout=30)
+        if not resp.ok:
+            sys.exit(f"not capturing on {a.serial} (start it first)")
+        d = resp.json()
+        for line in d["lines"]:
+            print(line)
+        if d["crashes"]:
+            print(f"\n!! {len(d['crashes'])} crash(es) detected:", file=sys.stderr)
+            for cr in d["crashes"]:
+                print(f"   [{cr['kind']}] {cr['line']}", file=sys.stderr)
+            sys.exit(2)
+        return None
+
+    if a.cmd == "batch-app":
+        body = {"serials": split_serials(a.serials), "action": a.action, "package": a.package}
+        if a.owner:
+            body["owner"] = a.owner
+        return call(a.base, "POST", "/api/batch/app", body)
+
+    if a.cmd == "batch-macro":
+        body = {"serials": split_serials(a.serials), "name": a.name, "count": a.count}
+        if a.owner:
+            body["owner"] = a.owner
+        return call(a.base, "POST", "/api/batch/macro", body)
+
+    if a.cmd == "batch-install":
+        data = {"serials": ",".join(split_serials(a.serials))}
+        if a.owner:
+            data["owner"] = a.owner
+        with open(a.apk, "rb") as fh:
+            resp = requests.post(f"{a.base}/api/batch/install", data=data,
+                                 files={"file": (os.path.basename(a.apk), fh)}, timeout=600)
+        body = resp.json()
+        print(json.dumps(body, indent=2, ensure_ascii=False))
+        # A partial batch is a failure for a pipeline, even though HTTP said 200.
+        if not resp.ok or body.get("status") == "partial":
+            sys.exit(1)
+        return body
 
     payloads = {
         "tap": {"type": "tap", "x": a.x, "y": a.y},

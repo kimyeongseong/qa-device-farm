@@ -163,6 +163,57 @@
             overflow: hidden;
         }
 
+        .device-card.batch-selected {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px var(--accent);
+        }
+
+        .batch-check {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            z-index: 11;
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+            accent-color: var(--accent);
+        }
+
+        /* Sticky action bar, hidden until something is selected */
+        #batch-bar {
+            display: none;
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            z-index: 500;
+            padding: 12px 24px;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            background: rgba(10, 10, 12, 0.94);
+            border-top: 1px solid var(--accent);
+            backdrop-filter: blur(12px);
+        }
+
+        #batch-bar.visible {
+            display: flex;
+        }
+
+        .log-line {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75em;
+            white-space: pre-wrap;
+            word-break: break-all;
+            line-height: 1.5;
+            color: #bbb;
+        }
+
+        .log-line.crash {
+            color: #ff6b6b;
+            font-weight: 700;
+        }
+
         .device-card::after {
             content: "";
             position: absolute;
@@ -382,12 +433,26 @@
             <div style="display:flex; gap:0; margin-bottom:20px;">
                 <button class="tab-btn active" onclick="switchTab('info')" id="tab-info">시스템 정보</button>
                 <button class="tab-btn" onclick="switchTab('apps')" id="tab-apps">앱 관리</button>
-                <!-- <button class="tab-btn" id="tab-macros" onclick="switchTab('macros')">매크로 (Beta)</button> -->
+                <button class="tab-btn" onclick="switchTab('macros')" id="tab-macros">매크로</button>
+                <button class="tab-btn" onclick="switchTab('logcat')" id="tab-logcat">로그</button>
             </div>
             <div id="info-content" class="tab-content active"></div>
             <div id="apps-content" class="tab-content"></div>
             <div id="macros-content" class="tab-content"></div>
+            <div id="logcat-content" class="tab-content"></div>
         </div>
+    </div>
+
+    <!-- Batch action bar: appears once at least one device is checked -->
+    <div id="batch-bar">
+        <span id="batch-count" style="font-family:'JetBrains Mono'; color:var(--accent);"></span>
+        <button class="btn btn-manage" style="width:auto;" onclick="batchMacroPrompt()">▶ 매크로 일괄 실행</button>
+        <button class="btn btn-manage" style="width:auto;" onclick="batchAppPrompt('launch')">앱 실행</button>
+        <button class="btn btn-manage" style="width:auto;" onclick="batchAppPrompt('stop')">앱 종료</button>
+        <button class="btn btn-manage" style="width:auto;" onclick="batchAppPrompt('clear')">데이터 초기화</button>
+        <button class="btn btn-manage" style="width:auto;" onclick="document.getElementById('batch-apk').click()">APK 일괄 설치</button>
+        <input type="file" id="batch-apk" accept=".apk" style="display:none" onchange="batchInstall(this)">
+        <button class="btn btn-delete" style="width:auto;" onclick="clearBatch()">선택 해제</button>
     </div>
 
     <div class="device-grid" id="device-container">
@@ -538,7 +603,11 @@
 
             document.querySelectorAll('.device-card').forEach(card => {
                 const serial = card.id.replace('card-', '');
-                if (!currentSerials.has(serial)) card.remove();
+                if (!currentSerials.has(serial)) {
+                    // A device that unplugged should not stay in the batch selection.
+                    card.remove();
+                    if (batchSelected.delete(serial)) renderBatchBar();
+                }
             });
 
             if (devices.length === 0 && container.children.length === 0) {
@@ -585,13 +654,16 @@
 
                 } else {
                     card = document.createElement('div');
-                    card.className = 'device-card';
+                    card.className = 'device-card' + (batchSelected.has(dev.serial) ? ' batch-selected' : '');
                     card.id = `card-${dev.serial}`;
                     card.setAttribute('ondrop', `dropHandler(event, '${dev.serial}')`);
                     card.setAttribute('ondragover', 'dragOverHandler(event)');
                     card.innerHTML = `
                          <div style="position:relative;">
                              <div style="position:absolute; top:5px; left:5px; background:rgba(0,0,0,0.7); color:#0f0; padding:2px 6px; font-size:0.8em; border-radius:4px; border:1px solid #0f0; z-index:10;">No.${index + 1}</div>
+                             <input type="checkbox" class="batch-check" title="일괄 작업 대상으로 선택"
+                                    ${batchSelected.has(dev.serial) ? 'checked' : ''}
+                                    onchange="toggleBatch('${dev.serial}', this.checked)">
                              <img class="device-thumb" src="/api/device/${dev.serial}/screenshot" onclick="openControl('${dev.serial}', '${dev.model}')">
                         </div>
                         <div class="card-header">
@@ -622,16 +694,21 @@
             document.getElementById('modalTitle').innerText = `[${model}] 환경 설정`;
             switchTab('info');
         }
-        function closeModal() { document.getElementById('manageModal').style.display = 'none'; }
+        function closeModal() {
+            document.getElementById('manageModal').style.display = 'none';
+            stopLogPolling();
+        }
 
         function switchTab(t) {
             document.querySelectorAll('.tab-content').forEach(e => e.classList.remove('active'));
             document.querySelectorAll('.tab-btn').forEach(e => e.classList.remove('active'));
             document.getElementById(`${t}-content`).classList.add('active');
             document.getElementById(`tab-${t}`).classList.add('active');
+            if (t !== 'logcat') stopLogPolling();
             if (t === 'info') loadInfo();
             if (t === 'apps') loadApps();
             if (t === 'macros') loadMacros();
+            if (t === 'logcat') loadLogcat();
         }
 
         async function loadInfo() {
@@ -682,7 +759,7 @@
             if (!isPlaying) {
                 // START
                 if (!confirm("PC 스피커로 소리를 재생합니다.\n(작은 오디오 창이 뜹니다. 닫지 마세요!)")) return;
-                const res = await fetch(`/ api / audio / start / ${currentSerial} `, { method: 'POST' });
+                const res = await fetch(`/api/audio/start/${currentSerial}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'success') {
                     window[`audio_${currentSerial} `] = true;
@@ -690,7 +767,7 @@
                 } else alert("오류: " + data.message);
             } else {
                 // STOP
-                const res = await fetch(`/ api / audio / stop / ${currentSerial} `, { method: 'POST' });
+                const res = await fetch(`/api/audio/stop/${currentSerial}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'success') {
                     window[`audio_${currentSerial} `] = false;
@@ -699,41 +776,236 @@
             }
             loadInfo(); // Refresh UI
         }
+        // Small helper so every JSON POST sends the right content type.
+        async function postJson(url, body) {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {})
+            });
+            return { ok: res.ok, data: await res.json().catch(() => ({})) };
+        }
+
         async function loadApps() {
             const div = document.getElementById('apps-content');
             div.innerHTML = '패키지 목록 불러오는 중...';
-            const res = await fetch(`/ api / packages / ${currentSerial} `);
+            const res = await fetch(`/api/packages/${currentSerial}`);
             const data = await res.json();
             div.innerHTML = '';
-            if (data.packages) {
-                data.packages.forEach(p => {
-                    const r = document.createElement('div');
-                    r.className = 'pkg-item';
-                    r.innerHTML = `< span > ${p}</span > <button class="btn btn-delete" onclick="uninstall('${p}')">삭제</button>`;
-                    div.appendChild(r);
-                });
+            if (!data.packages || data.packages.length === 0) {
+                div.innerHTML = '설치된 서드파티 앱이 없습니다.';
+                return;
+            }
+            data.packages.forEach(p => {
+                const r = document.createElement('div');
+                r.className = 'pkg-item';
+                r.innerHTML = `<span>${p}</span>
+                    <div style="display:flex; gap:5px;">
+                        <button class="btn btn-delete" style="color:#8ef; border-color:#356;" onclick="appAction('launch','${p}')">실행</button>
+                        <button class="btn btn-delete" style="color:#ccc; border-color:#555;" onclick="appAction('stop','${p}')">종료</button>
+                        <button class="btn btn-delete" style="color:#fc8; border-color:#653;" onclick="appAction('clear','${p}')">초기화</button>
+                        <button class="btn btn-delete" onclick="uninstall('${p}')">삭제</button>
+                    </div>`;
+                div.appendChild(r);
+            });
+        }
+
+        const APP_ACTION_LABEL = { launch: '실행', stop: '종료', clear: '데이터 초기화' };
+        async function appAction(action, pkg) {
+            if (action === 'clear' && !confirm(`${pkg}\n\n앱 데이터를 모두 지웁니다. 계속할까요?`)) return;
+            const { ok, data } = await postJson(`/api/app/${currentSerial}/${action}`, { package: pkg });
+            if (ok) return;
+            // A held device is the common case here, and it needs a different
+            // instruction than a generic adb failure.
+            if (data.owner) {
+                alert(`${APP_ACTION_LABEL[action]} 불가\n\n`
+                    + `'${data.owner}' 님이 이 기기를 점유 중입니다.\n`
+                    + `테스트 중일 수 있으니 점유가 끝난 뒤 진행하세요.`);
+            } else {
+                alert(`${APP_ACTION_LABEL[action]} 실패: ${data.message || '알 수 없는 오류'}`);
             }
         }
+
         async function loadMacros() {
             const div = document.getElementById('macros-content');
             div.innerHTML = '매크로 DB 로딩 중...';
             const res = await fetch('/api/macros');
             const data = await res.json();
             div.innerHTML = '';
-            if (data.macros.length === 0) div.innerHTML = "저장된 매크로가 없습니다.";
-            data.macros.forEach(m => {
+            const list = data.details || [];
+            if (list.length === 0) { div.innerHTML = '저장된 매크로가 없습니다.'; return; }
+            list.forEach(m => {
+                // Recording resolution matters: replay on a different screen is rescaled.
+                const meta = m.width
+                    ? `${m.events ?? '?'} 스텝 · ${m.width}x${m.height}`
+                    : `${m.events ?? '?'} 스텝 · 해상도 미기록(스케일 불가)`;
                 const r = document.createElement('div');
                 r.className = 'pkg-item';
-                r.innerHTML = `< span > ${m}</span > <div><button class="btn btn-delete" style="color:white; border-color:#555;" onclick="playMacro('${m}')">실행</button></div>`;
+                r.innerHTML = `<span>${m.name}<br><span style="font-size:0.75em; color:#666;">${meta}</span></span>
+                    <div style="display:flex; gap:5px;">
+                        <button class="btn btn-delete" style="color:white; border-color:#555;" onclick="playMacro('${m.name}')">실행</button>
+                        <button class="btn btn-delete" onclick="deleteMacro('${m.name}')">삭제</button>
+                    </div>`;
                 div.appendChild(r);
             });
         }
-        async function uninstall(pkg) { if (!confirm(pkg + ' 앱을 삭제하시겠습니까?')) return; await fetch(`/ api / uninstall / ${currentSerial} `, { method: 'POST', body: JSON.stringify({ package: pkg }) }); loadApps(); }
-        async function playMacro(name) { if (!confirm(name + ' 매크로를 실행하시겠습니까?')) return; await fetch(`/ api / macros / play / ${currentSerial} `, { method: 'POST', body: JSON.stringify({ name: name }) }); }
-        async function toggleWireless() { await fetch(`/ api / wireless / ${currentSerial} `, { method: 'POST' }); alert('무선 연결 명령을 전송했습니다. 케이블 분리 전 로그를 확인하세요.'); }
+
+        async function deleteMacro(name) {
+            if (!confirm(`${name} 매크로를 삭제하시겠습니까? 되돌릴 수 없습니다.`)) return;
+            const res = await fetch(`/api/macros/${encodeURIComponent(name)}`, { method: 'DELETE' });
+            if (!res.ok) {
+                const d = await res.json().catch(() => ({}));
+                alert('삭제 실패: ' + (d.message || res.status));
+            }
+            loadMacros();
+        }
+
+        // --- Logcat ---
+        let logPollTimer = null;
+        function stopLogPolling() { clearInterval(logPollTimer); logPollTimer = null; }
+
+        async function loadLogcat() {
+            const div = document.getElementById('logcat-content');
+            div.innerHTML = `
+                <div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; align-items:center;">
+                    <button class="btn btn-delete" style="color:#8f8; border-color:#363;" onclick="logcatStart()">수집 시작</button>
+                    <button class="btn btn-delete" style="color:#ccc; border-color:#555;" onclick="logcatStop()">중지</button>
+                    <button class="btn btn-delete" style="color:#8ef; border-color:#356;" onclick="logcatDownload()">다운로드</button>
+                    <input id="log-filter" placeholder="필터 (예: Exception)" oninput="refreshLog()"
+                        style="flex:1; min-width:140px; background:#111; border:1px solid #333; color:#ddd; padding:6px; font-family:'JetBrains Mono'; font-size:0.8em;">
+                </div>
+                <div id="log-summary" style="font-family:'JetBrains Mono'; font-size:0.8em; margin-bottom:8px; color:#888;"></div>
+                <div id="log-body" style="max-height:320px; overflow:auto; background:#0a0a0a; border:1px solid #222; padding:10px;"></div>`;
+            refreshLog();
+            stopLogPolling();
+            logPollTimer = setInterval(refreshLog, 2000);
+        }
+
+        async function logcatStart() {
+            const { ok, data } = await postJson(`/api/logcat/${currentSerial}/start`, { clear: true, level: 'V' });
+            if (!ok) alert('수집 시작 실패: ' + (data.message || ''));
+            refreshLog();
+        }
+        async function logcatStop() {
+            await postJson(`/api/logcat/${currentSerial}/stop`, {});
+            refreshLog();
+        }
+        function logcatDownload() {
+            window.open(`/api/logcat/${currentSerial}/download`, '_blank');
+        }
+
+        async function refreshLog() {
+            const summary = document.getElementById('log-summary');
+            const body = document.getElementById('log-body');
+            if (!summary || !body) return;
+
+            const filter = (document.getElementById('log-filter') || {}).value || '';
+            const qs = filter ? `?tail=300&contains=${encodeURIComponent(filter)}` : '?tail=300';
+            const res = await fetch(`/api/logcat/${currentSerial}${qs}`);
+
+            if (!res.ok) {
+                summary.innerHTML = `<span style="color:#666;">수집 중이 아닙니다. [수집 시작]을 누르세요.</span>`;
+                body.innerHTML = '';
+                return;
+            }
+
+            const d = await res.json();
+            const crashNote = d.crashes.length
+                ? `<span style="color:#ff6b6b; font-weight:700;">크래시 ${d.crashes.length}건</span>`
+                : `<span style="color:var(--success-color);">크래시 없음</span>`;
+            summary.innerHTML = `● 수집 중 · ${d.total}줄${filter ? ` (필터 일치 ${d.matched})` : ''} · ${crashNote}`;
+
+            // Only the tail is rendered; the full buffer is what the download gives you.
+            const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
+            body.innerHTML = d.lines
+                .map(l => `<div class="log-line${/FATAL EXCEPTION|ANR in |Fatal signal/.test(l) ? ' crash' : ''}">${escapeHtml(l)}</div>`)
+                .join('');
+            if (atBottom) body.scrollTop = body.scrollHeight;
+        }
+
+        function escapeHtml(s) {
+            return s.replace(/[&<>"']/g, ch => (
+                { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+            ));
+        }
+
+        // --- Batch selection ---
+        const batchSelected = new Set();
+
+        function toggleBatch(serial, checked) {
+            checked ? batchSelected.add(serial) : batchSelected.delete(serial);
+            const card = document.getElementById(`card-${serial}`);
+            if (card) card.classList.toggle('batch-selected', checked);
+            renderBatchBar();
+        }
+
+        function clearBatch() {
+            batchSelected.clear();
+            document.querySelectorAll('.batch-check').forEach(cb => cb.checked = false);
+            document.querySelectorAll('.device-card').forEach(c => c.classList.remove('batch-selected'));
+            renderBatchBar();
+        }
+
+        function renderBatchBar() {
+            const bar = document.getElementById('batch-bar');
+            bar.classList.toggle('visible', batchSelected.size > 0);
+            document.getElementById('batch-count').innerText = `${batchSelected.size}대 선택됨`;
+        }
+
+        // Every batch call reports per-device results. Separate "someone else has
+        // it" from "it broke" -- they need different reactions from the operator.
+        function reportBatch(title, data) {
+            if (!data || !data.results) { alert(`${title} 실패: ${(data && data.message) || '알 수 없는 오류'}`); return; }
+            const failed = data.results.filter(r => r.status === 'error');
+            const skipped = data.results.filter(r => r.status === 'skipped');
+            if (!failed.length && !skipped.length) { alert(`${title}: ${data.succeeded}대 모두 성공`); return; }
+
+            const lines = [`${title}: 성공 ${data.succeeded} / 실패 ${data.failed} / 점유중 건너뜀 ${data.skipped || 0}`, ''];
+            skipped.forEach(s => lines.push(`· ${s.serial}: ${s.message} — 점유 해제 후 재시도하세요`));
+            failed.forEach(f => lines.push(`· ${f.serial}: ${f.message}`));
+            alert(lines.join('\n'));
+        }
+
+        async function batchAppPrompt(action) {
+            const pkg = prompt(`패키지명을 입력하세요 (${APP_ACTION_LABEL[action]})`, 'com.example.app');
+            if (!pkg) return;
+            const { data } = await postJson('/api/batch/app',
+                { serials: [...batchSelected], action, package: pkg.trim() });
+            reportBatch(`일괄 ${APP_ACTION_LABEL[action]}`, data);
+        }
+
+        async function batchMacroPrompt() {
+            const res = await fetch('/api/macros');
+            const names = (await res.json()).macros || [];
+            if (!names.length) { alert('저장된 매크로가 없습니다.'); return; }
+            const name = prompt(`실행할 매크로 이름:\n\n${names.join('\n')}`, names[0]);
+            if (!name) return;
+            const count = parseInt(prompt('반복 횟수', '1'), 10) || 1;
+            const { data } = await postJson('/api/batch/macro',
+                { serials: [...batchSelected], name: name.trim(), count });
+            reportBatch('일괄 매크로 실행', data);
+        }
+
+        async function batchInstall(input) {
+            const file = input.files[0];
+            input.value = '';
+            if (!file) return;
+            const targets = [...batchSelected];
+            if (!confirm(`${file.name}\n\n${targets.length}대에 설치합니다. 계속할까요?`)) return;
+
+            const fd = new FormData();
+            fd.append('file', file);
+            fd.append('serials', targets.join(','));
+            const res = await fetch('/api/batch/install', { method: 'POST', body: fd });
+            reportBatch('일괄 APK 설치', await res.json().catch(() => null));
+        }
+
+        async function uninstall(pkg) { if (!confirm(pkg + ' 앱을 삭제하시겠습니까?')) return; await postJson(`/api/uninstall/${currentSerial}`, { package: pkg }); loadApps(); }
+        async function playMacro(name) { if (!confirm(name + ' 매크로를 실행하시겠습니까?')) return; await postJson(`/api/macros/play/${currentSerial}`, { name: name }); }
+        async function toggleWireless() { await fetch(`/api/wireless/${currentSerial}`, { method: 'POST' }); alert('무선 연결 명령을 전송했습니다. 케이블 분리 전 로그를 확인하세요.'); }
         function dragOverHandler(ev) { ev.preventDefault(); ev.dataTransfer.dropEffect = "copy"; }
         function dropHandler(ev, serial) { ev.preventDefault(); if (ev.dataTransfer.items) { [...ev.dataTransfer.items].forEach((item) => { if (item.kind === 'file') { const file = item.getAsFile(); if (file.name.endsWith('.apk')) uploadApk(file, serial); } }); } }
-        async function uploadApk(file, serial) { alert(file.name + ' 설치를 시작합니다...'); const fd = new FormData(); fd.append('file', file); await fetch(`/ api / install / ${serial}`, { method: 'POST', body: fd }); alert('설치가 완료되었습니다.'); }
+        async function uploadApk(file, serial) { alert(file.name + ' 설치를 시작합니다...'); const fd = new FormData(); fd.append('file', file); await fetch(`/api/install/${serial}`, { method: 'POST', body: fd }); alert('설치가 완료되었습니다.'); }
 
         fetchDevices();
         setInterval(fetchDevices, 2000);

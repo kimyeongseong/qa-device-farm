@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, Request, File, UploadFile
+from fastapi import FastAPI, WebSocket, Request, File, Form, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -646,6 +646,51 @@ active_recordings = {} # { serial: [ {event...}, ... ] }
 
 import glob
 
+def macro_path(name: str) -> str:
+    """Map a macro name to a file inside MACROS_DIR.
+
+    The name arrives from the client, so anything that could climb out of the
+    directory ('../secrets', an absolute path, a leading dot) is refused rather
+    than normalised -- a caller asking for that is not asking for a macro.
+    """
+    if not name or os.path.basename(name) != name or name.startswith("."):
+        raise ValueError(f"Invalid macro name: {name!r}")
+    return os.path.join(MACROS_DIR, f"{name}.json")
+
+def get_device_resolution(serial: str):
+    """Physical screen size as (width, height), or None if the device won't say."""
+    try:
+        res = adb.device(serial=serial).shell("wm size")
+        if res and "Physical size:" in res:
+            w, h = res.split(":")[-1].strip().split("x")
+            return int(w), int(h)
+    except Exception:
+        pass
+    return None
+
+def scale_event(event: dict, sx: float, sy: float) -> dict:
+    """Rescale tap/swipe coordinates for a screen of a different size."""
+    if sx == 1.0 and sy == 1.0:
+        return event
+    out = dict(event)
+    for key, factor in (("x", sx), ("x1", sx), ("x2", sx),
+                        ("y", sy), ("y1", sy), ("y2", sy)):
+        if out.get(key) is not None:
+            out[key] = round(out[key] * factor)
+    return out
+
+def read_macro(name: str):
+    """Load a macro file, accepting both the v1 (bare list) and v2 layouts.
+
+    v1 recordings carry no resolution, so they replay unscaled -- the same
+    behaviour they had before scaling existed.
+    """
+    with open(macro_path(name), "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return {"version": 1, "recorded_on": None, "events": data}
+    return data
+
 @app.post("/api/macros/start_record/{serial}")
 async def start_record(serial: str):
     active_recordings[serial] = []
@@ -656,67 +701,116 @@ async def start_record(serial: str):
 async def stop_record(serial: str, request: Request):
     try:
         body = await request.json()
-        name = body.get("name", f"macro_{int(time.time())}")
-        
+        name = body.get("name") or f"macro_{int(time.time())}"
+
         if serial not in active_recordings:
             return JSONResponse({"status": "error", "message": "Not recording"}, status_code=400)
-            
+
         events = active_recordings.pop(serial)
-        
-        # Save to file
-        filename = os.path.join(MACROS_DIR, f"{name}.json")
-        with open(filename, "w") as f:
-            json.dump(events, f)
-            
-        print(f"[{serial}] Recording Saved: {name}")
-        return {"status": "success", "count": len(events)}
+
+        # Record the screen size alongside the events, so the same macro can be
+        # replayed on a device with a different resolution.
+        resolution = get_device_resolution(serial)
+        payload = {
+            "version": 2,
+            "recorded_on": {
+                "serial": serial,
+                "width": resolution[0] if resolution else None,
+                "height": resolution[1] if resolution else None,
+            },
+            "events": events,
+        }
+
+        with open(macro_path(name), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+
+        print(f"[{serial}] Recording Saved: {name} ({len(events)} events)")
+        return {"status": "success", "count": len(events), "resolution": resolution}
+    except ValueError as bad_name:
+        return JSONResponse({"status": "error", "message": str(bad_name)}, status_code=400)
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 @app.get("/api/macros")
 async def list_macros():
-    files = glob.glob(os.path.join(MACROS_DIR, "*.json"))
-    macros = [os.path.basename(f).replace(".json", "") for f in files]
-    return {"macros": macros}
+    macros = []
+    for path in sorted(glob.glob(os.path.join(MACROS_DIR, "*.json"))):
+        name = os.path.basename(path)[:-len(".json")]
+        entry = {"name": name, "events": None, "width": None, "height": None}
+        try:
+            data = read_macro(name)
+            entry["events"] = len(data.get("events", []))
+            rec = data.get("recorded_on") or {}
+            entry["width"], entry["height"] = rec.get("width"), rec.get("height")
+        except Exception:
+            pass  # An unreadable file still gets listed, just without detail.
+        macros.append(entry)
+    # 'names' keeps the old flat shape working for existing callers.
+    return {"macros": [m["name"] for m in macros], "details": macros}
 
 @app.post("/api/macros/play/{serial}")
 async def play_macro(serial: str, request: Request):
     body = await request.json()
     name = body.get("name")
     count = int(body.get("count", 1)) # Default 1 loop
-    
-    filename = os.path.join(MACROS_DIR, f"{name}.json")
-    
-    if not os.path.exists(filename):
+
+    try:
+        macro = read_macro(name)
+    except ValueError as bad_name:
+        return JSONResponse({"status": "error", "message": str(bad_name)}, status_code=400)
+    except FileNotFoundError:
         return JSONResponse({"status": "error", "message": "Macro not found"}, status_code=404)
-        
-    # Start background task
-    with open(filename, "r") as f:
-        events = json.load(f)
-        
-    asyncio.create_task(run_macro_bg(serial, events, count))
+
+    asyncio.create_task(run_macro_bg(serial, macro, count))
     return {"status": "success", "message": f"Playback started ({count} loops)"}
+
+@app.delete("/api/macros/{name}")
+async def delete_macro(name: str):
+    try:
+        path = macro_path(name)
+    except ValueError as bad_name:
+        return JSONResponse({"status": "error", "message": str(bad_name)}, status_code=400)
+    if not os.path.exists(path):
+        return JSONResponse({"status": "error", "message": "Macro not found"}, status_code=404)
+    os.remove(path)
+    print(f"Macro deleted: {name}")
+    return {"status": "success", "deleted": name}
 
 @app.get("/api/macros/{name}")
 async def get_macro_content(name: str):
-    filename = os.path.join(MACROS_DIR, f"{name}.json")
-    if not os.path.exists(filename):
+    try:
+        return {"status": "success", "data": read_macro(name)}
+    except ValueError as bad_name:
+        return JSONResponse({"status": "error", "message": str(bad_name)}, status_code=400)
+    except FileNotFoundError:
         return JSONResponse({"status": "error", "message": "Macro not found"}, status_code=404)
-    with open(filename, "r") as f:
-        data = json.load(f)
-    return {"status": "success", "data": data}
 
-async def run_macro_bg(serial, events, count=1):
-    print(f"[{serial}] Replay Started ({count} loops)")
+async def run_macro_bg(serial, macro, count=1):
+    events = macro.get("events") if isinstance(macro, dict) else macro
+    if not events:
+        return
+
     adb_path = get_adb_path()
-    if not events: return
-    
+
+    # Work out the coordinate scale for this target device.
+    sx = sy = 1.0
+    rec = (macro.get("recorded_on") or {}) if isinstance(macro, dict) else {}
+    if rec.get("width") and rec.get("height"):
+        target = get_device_resolution(serial)
+        if target:
+            sx, sy = target[0] / rec["width"], target[1] / rec["height"]
+            if (sx, sy) != (1.0, 1.0):
+                print(f"[{serial}] Scaling macro {rec['width']}x{rec['height']} "
+                      f"-> {target[0]}x{target[1]}")
+
+    print(f"[{serial}] Replay Started ({count} loops)")
+
     for i in range(count):
         print(f"[{serial}] Loop {i+1}/{count}")
-        
+
         start_time = events[0].get("timestamp", 0)
         prev_time = start_time
-        
+
         for event in events:
             curr_time = event.get("timestamp", 0)
             delay = curr_time - prev_time
@@ -726,14 +820,344 @@ async def run_macro_bg(serial, events, count=1):
 
             # Execute Command
             try:
-                await dispatch_input(adb_path, serial, event)
+                await dispatch_input(adb_path, serial, scale_event(event, sx, sy))
             except (ValueError, RuntimeError) as step_err:
                 print(f"[{serial}] Replay step failed: {step_err}")
 
         # Optional delay between loops
         await asyncio.sleep(1)
-            
+
     print(f"[{serial}] Replay Finished")
+
+
+# --- App Control ---
+# Launch / stop / wipe an app. These are the three things you do between test
+# runs, and doing them by hand over adb is most of the friction in a manual pass.
+
+import re as _re
+
+PACKAGE_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
+
+def check_package(package: str) -> str:
+    if not package or not PACKAGE_RE.match(package):
+        raise ValueError(f"Invalid package name: {package!r}")
+    return package
+
+class AppRequest(BaseModel):
+    package: str
+    owner: str = None
+
+APP_ACTIONS = {
+    # monkey resolves the launcher activity for us, so the caller only needs the package.
+    "launch": lambda pkg: ("shell", "monkey", "-p", pkg, "-c",
+                           "android.intent.category.LAUNCHER", "1"),
+    "stop":   lambda pkg: ("shell", "am", "force-stop", pkg),
+    "clear":  lambda pkg: ("shell", "pm", "clear", pkg),
+}
+
+async def run_app_action(serial: str, action: str, package: str):
+    check_package(package)
+    if action not in APP_ACTIONS:
+        raise ValueError(f"Unknown action: {action!r} (expected one of {list(APP_ACTIONS)})")
+    await adb_exec(get_adb_path(), serial, *APP_ACTIONS[action](package))
+
+@app.post("/api/app/{serial}/{action}")
+async def app_control(serial: str, action: str, req: AppRequest):
+    """action is one of launch / stop / clear."""
+    conflict = lease_conflict(serial, req.owner)
+    if conflict:
+        return conflict
+    try:
+        await run_app_action(serial, action, req.package)
+        return {"status": "success", "action": action, "package": req.package}
+    except ValueError as bad:
+        return JSONResponse({"status": "error", "message": str(bad)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+# --- Logcat Capture ---
+# QA work lives or dies on the log. Pulling logcat by hand per device does not
+# scale past a couple of phones, so the server tails it into a bounded buffer
+# and flags the lines that mean "this run failed".
+
+from collections import deque
+
+LOGCAT_MAX_LINES = 20000
+
+# A crash is worth surfacing on its own rather than making someone scroll.
+CRASH_PATTERNS = [
+    ("java",   _re.compile(r"FATAL EXCEPTION")),
+    ("native", _re.compile(r"F/libc|Fatal signal \d+ \(SIG")),
+    ("anr",    _re.compile(r"ANR in ")),
+]
+
+logcat_sessions = {}  # { serial: {"proc":, "task":, "lines": deque, "crashes": [], "started": float} }
+
+def find_crash(line: str):
+    for kind, pattern in CRASH_PATTERNS:
+        if pattern.search(line):
+            return kind
+    return None
+
+async def pump_logcat(serial: str, session: dict):
+    """Read logcat lines until the process ends or the session is stopped."""
+    stream = session["proc"].stdout
+    while True:
+        raw = await stream.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            continue
+        session["lines"].append(line)
+        kind = find_crash(line)
+        if kind:
+            session["crashes"].append({"kind": kind, "line": line, "at": time.time()})
+            print(f"[{serial}] CRASH ({kind}): {line[:160]}")
+
+class LogcatStartRequest(BaseModel):
+    clear: bool = True          # drop whatever is already buffered on the device
+    level: str = "V"            # V/D/I/W/E/F -- minimum priority to keep
+    owner: str = None
+
+@app.post("/api/logcat/{serial}/start")
+async def start_logcat(serial: str, req: LogcatStartRequest = LogcatStartRequest()):
+    conflict = lease_conflict(serial, req.owner)
+    if conflict:
+        return conflict
+
+    if serial in logcat_sessions:
+        return {"status": "success", "message": "Already capturing"}
+
+    level = (req.level or "V").upper()
+    if level not in ("V", "D", "I", "W", "E", "F"):
+        return JSONResponse({"status": "error", "message": f"Invalid level: {req.level!r}"},
+                            status_code=400)
+
+    adb_path = get_adb_path()
+    try:
+        if req.clear:
+            await adb_exec(adb_path, serial, "logcat", "-c")
+
+        proc = await asyncio.create_subprocess_exec(
+            adb_path, "-s", serial, "logcat", "-v", "time", f"*:{level}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+    session = {
+        "proc": proc,
+        "lines": deque(maxlen=LOGCAT_MAX_LINES),
+        "crashes": [],
+        "started": time.time(),
+        "level": level,
+    }
+    session["task"] = asyncio.create_task(pump_logcat(serial, session))
+    logcat_sessions[serial] = session
+
+    print(f"[{serial}] Logcat capture started (level {level})")
+    return {"status": "success", "level": level}
+
+@app.post("/api/logcat/{serial}/stop")
+async def stop_logcat(serial: str):
+    session = logcat_sessions.pop(serial, None)
+    if not session:
+        return {"status": "success", "message": "Not capturing"}
+    try:
+        session["proc"].terminate()
+    except Exception:
+        pass
+    session["task"].cancel()
+    print(f"[{serial}] Logcat capture stopped ({len(session['lines'])} lines)")
+    return {"status": "success", "lines": len(session["lines"]),
+            "crashes": len(session["crashes"])}
+
+@app.get("/api/logcat/{serial}")
+async def get_logcat(serial: str, tail: int = 500, contains: str = None):
+    """Buffered lines, newest last. `tail` caps the response, `contains` filters."""
+    session = logcat_sessions.get(serial)
+    if not session:
+        return JSONResponse({"status": "error", "message": "Not capturing"}, status_code=404)
+
+    lines = list(session["lines"])
+    if contains:
+        needle = contains.lower()
+        lines = [ln for ln in lines if needle in ln.lower()]
+
+    return {
+        "status": "success",
+        "capturing": True,
+        "level": session["level"],
+        "started": session["started"],
+        "total": len(session["lines"]),
+        "matched": len(lines),
+        "crashes": session["crashes"],
+        "lines": lines[-max(1, tail):],
+    }
+
+@app.get("/api/logcat/{serial}/download")
+async def download_logcat(serial: str):
+    session = logcat_sessions.get(serial)
+    if not session:
+        return JSONResponse({"status": "error", "message": "Not capturing"}, status_code=404)
+    body = "\n".join(session["lines"]) + "\n"
+    return Response(
+        content=body.encode("utf-8"),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="logcat_{serial}.txt"'},
+    )
+
+@app.get("/api/logcat")
+async def logcat_status():
+    """Which devices are being captured, and has anything crashed."""
+    return {
+        "sessions": {
+            serial: {
+                "lines": len(s["lines"]),
+                "crashes": len(s["crashes"]),
+                "level": s["level"],
+                "started": s["started"],
+            }
+            for serial, s in logcat_sessions.items()
+        }
+    }
+
+
+# --- Batch Operations ---
+# One action across many devices at once. This is the whole point of a farm:
+# install this build everywhere, replay this scenario everywhere, then tell me
+# which devices failed.
+
+def lease_block_reason(serial: str, owner):
+    """Why this caller may not touch the device right now, or None if it may."""
+    lease = get_lease(serial)
+    if lease and lease["owner"] != owner:
+        return f"held by '{lease['owner']}'"
+    return None
+
+async def gather_per_device(serials, coro_factory, owner=None):
+    """Run one coroutine per device concurrently and report each result separately.
+
+    A device that fails is reported as a failure, not raised -- the caller wants
+    the other nine results. Devices somebody else has leased come back as
+    'skipped' rather than 'error': nothing went wrong, the farm just declined.
+    """
+    if not serials:
+        raise ValueError("No serials given")
+
+    async def one(serial):
+        blocked = lease_block_reason(serial, owner)
+        if blocked:
+            return {"serial": serial, "status": "skipped", "message": blocked}
+        try:
+            detail = await coro_factory(serial)
+            return {"serial": serial, "status": "success", "message": detail or "ok"}
+        except Exception as e:
+            return {"serial": serial, "status": "error", "message": str(e)}
+
+    results = await asyncio.gather(*(one(s) for s in serials))
+    failed = [r for r in results if r["status"] == "error"]
+    skipped = [r for r in results if r["status"] == "skipped"]
+    return {
+        "status": "success" if not (failed or skipped) else "partial",
+        "total": len(results),
+        "succeeded": len(results) - len(failed) - len(skipped),
+        "failed": len(failed),
+        "skipped": len(skipped),
+        "results": results,
+    }
+
+class BatchInputRequest(BaseModel):
+    serials: list
+    event: dict
+    owner: str = None
+
+@app.post("/api/batch/input")
+async def batch_input(req: BatchInputRequest):
+    adb_path = get_adb_path()
+
+    async def act(serial):
+        await dispatch_input(adb_path, serial, req.event)
+
+    try:
+        return await gather_per_device(req.serials, act, req.owner)
+    except ValueError as bad:
+        return JSONResponse({"status": "error", "message": str(bad)}, status_code=400)
+
+class BatchAppRequest(BaseModel):
+    serials: list
+    action: str
+    package: str
+    owner: str = None
+
+@app.post("/api/batch/app")
+async def batch_app(req: BatchAppRequest):
+    try:
+        check_package(req.package)
+        return await gather_per_device(
+            req.serials, lambda s: run_app_action(s, req.action, req.package), req.owner
+        )
+    except ValueError as bad:
+        return JSONResponse({"status": "error", "message": str(bad)}, status_code=400)
+
+class BatchMacroRequest(BaseModel):
+    serials: list
+    name: str
+    count: int = 1
+    owner: str = None
+
+@app.post("/api/batch/macro")
+async def batch_macro(req: BatchMacroRequest):
+    """Replay one macro on several devices at once.
+
+    Playback is a background task per device, so this returns as soon as every
+    device has started -- coordinates are rescaled per device on the way in.
+    """
+    try:
+        macro = read_macro(req.name)
+    except ValueError as bad:
+        return JSONResponse({"status": "error", "message": str(bad)}, status_code=400)
+    except FileNotFoundError:
+        return JSONResponse({"status": "error", "message": "Macro not found"}, status_code=404)
+
+    async def start(serial):
+        asyncio.create_task(run_macro_bg(serial, macro, req.count))
+        return f"playback started ({req.count} loops)"
+
+    try:
+        return await gather_per_device(req.serials, start, req.owner)
+    except ValueError as bad:
+        return JSONResponse({"status": "error", "message": str(bad)}, status_code=400)
+
+@app.post("/api/batch/install")
+async def batch_install(serials: str = Form(...), owner: str = Form(None),
+                        file: UploadFile = File(...)):
+    """Install one APK on several devices. `serials` is a comma-separated list."""
+    targets = [s.strip() for s in serials.split(",") if s.strip()]
+    safe_name = os.path.basename(file.filename or "upload.apk").replace("\\", "_")
+    temp_file = f"temp_batch_{safe_name}"
+
+    try:
+        with open(temp_file, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        adb_path = get_adb_path()
+
+        async def install(serial):
+            await adb_exec(adb_path, serial, "install", "-r", temp_file)
+            return "installed"
+
+        return await gather_per_device(targets, install, owner)
+    except ValueError as bad:
+        return JSONResponse({"status": "error", "message": str(bad)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
 
 
 active_audio_procs = {} # { serial: subprocess_obj }
