@@ -20,6 +20,13 @@ if not exist "%WS_SCRCPY_CONFIG%" (
     echo        which collides with common dev tooling. See the README.
 )
 
+:: ws-scrcpy shells out to `adb` from PATH (it spawns the process itself rather
+:: than speaking the protocol), so a bundled copy that only server.py knows about
+:: leaves the stream server unable to push scrcpy onto the device -- it fails with
+:: "spawn adb ENOENT" while /api/health still reports adb as fine. Put the bundled
+:: directory on PATH for both children so the two agree on which adb exists.
+if exist "%~dp0scrcpy_bin\adb.exe" set "PATH=%~dp0scrcpy_bin;%PATH%"
+
 :: Start Backend (Python FastAPI)
 start "Backend Server (8001)" cmd /k "python server.py"
 

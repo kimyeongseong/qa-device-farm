@@ -52,6 +52,8 @@ Browser (dashboard)          CLI / CI pipeline
 
 adb is taken from `scrcpy_bin/` first, then from PATH. `GET /api/health` reports the `adb_path` actually in use.
 
+**The two servers find adb differently.** `server.py` resolves the path itself in that order, but **ws-scrcpy spawns `adb` from PATH** — it runs the binary rather than speaking the protocol. So an adb that lives only in `scrcpy_bin/` leaves the dashboard, input and install all working while mirroring alone fails, with `spawn adb ENOENT` in the ws-scrcpy log. `run_root_server.bat` prepends `scrcpy_bin/` to PATH so both agree; if you start `npm start` yourself, **adb has to be on PATH.**
+
 Audio forwarding needs a [scrcpy](https://github.com/Genymobile/scrcpy/releases) 2.7+ binary, which is not redistributed here for licensing reasons. Put it in `scrcpy_bin/` or on PATH. Without it only the audio button returns 503; everything else works.
 
 ```bash
@@ -136,6 +138,8 @@ Get-NetTCPConnection -LocalPort 8010 -State Listen | ForEach-Object { Get-Proces
 ```
 
 If it is taken, change `port` in `ws-scrcpy.config.json` and restart both servers.
+
+**When mirroring stops after an adb server restart**: `adb kill-server` drops the connection ws-scrcpy was holding, and its node process does not recover on its own. If the browser console shows `WS closed: socket hang up`, **restart ws-scrcpy**. Reset stream will not help — that clears leftovers on the *device*, and this failure is host-side state.
 
 **When the mirror is black, or the log says `unknown host service`**: restarting ws-scrcpy does not always take down the scrcpy server it pushed onto the device, and the leftover process holds the port so the next connection gets nothing.
 

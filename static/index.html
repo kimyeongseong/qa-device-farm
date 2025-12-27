@@ -802,8 +802,13 @@
                 div.innerHTML = `
                 <div style="background:#111; padding:20px; border-radius:4px; border:1px solid #333; font-family:'JetBrains Mono', 'Malgun Gothic';">
                     <div style="color:var(--accent-color); margin-bottom:10px;">>> 시스템 상세 정보</div>
-                    <div>모델명: ${i.model}</div>
+                    <div>모델명: ${i.manufacturer || ''} ${i.model}</div>
                     <div>OS 버전: Android ${i.android_version} (SDK ${i.sdk})</div>
+                    <div>빌드: ${i.build_id || '-'}</div>
+                    <div>해상도: ${i.width && i.height ? `${i.width} x ${i.height}` : '-'}</div>
+                    <div>CPU: ${i.cpu || '-'}${i.abi ? ` (${i.abi})` : ''}</div>
+                    <div>RAM: ${i.memory || '-'}</div>
+                    <div>실행 중인 앱: ${i.current_app || '-'}</div>
                     <div>IP 주소: ${i.ip}</div>
                     <div style="color:#666; font-size:0.9em; margin-top:10px;">UID: ${i.serial}</div>
                 </div>

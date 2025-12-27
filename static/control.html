@@ -159,14 +159,39 @@
 
         const videoElement = document.getElementById('player');
 
+        // `adb input tap` wants device pixels, and the stream is not in them:
+        // screenrecord hands back a downscaled picture -- measured 720x1280 out of
+        // a 1600x2560 TB336FU -- so scaling a click by the video's own dimensions
+        // sent coordinates at 45% of where they belonged and every tap landed up
+        // near the top-left. Ask the farm what the screen actually is.
+        let deviceSize = null;
+        apiFetch('/api/devices')
+            .then((r) => r.json())
+            .then((d) => {
+                const me = (d.devices || []).find((x) => x.serial === serial);
+                if (me && me.width && me.height) {
+                    deviceSize = { w: me.width, h: me.height };
+                }
+            })
+            .catch(() => { /* fall back to the video's own dimensions below */ });
+
         // Mouse Events
         videoElement.addEventListener('mousedown', (e) => {
             const rect = videoElement.getBoundingClientRect();
             const x = e.clientX - rect.left;
             const y = e.clientY - rect.top;
 
-            const scaleX = videoElement.videoWidth / videoElement.offsetWidth;
-            const scaleY = videoElement.videoHeight / videoElement.offsetHeight;
+            let w = deviceSize ? deviceSize.w : videoElement.videoWidth;
+            let h = deviceSize ? deviceSize.h : videoElement.videoHeight;
+            // screenrecord follows the device's rotation, `wm size` does not, so
+            // line the two orientations up before scaling.
+            if (videoElement.videoWidth && videoElement.videoHeight
+                && (videoElement.videoWidth > videoElement.videoHeight) !== (w > h)) {
+                [w, h] = [h, w];
+            }
+
+            const scaleX = w / videoElement.offsetWidth;
+            const scaleY = h / videoElement.offsetHeight;
 
             controlWs.send(JSON.stringify({
                 type: 'tap',

@@ -52,6 +52,8 @@ QA 업무 중 실기기가 개인 PC에 묶여 있어서 생기던 문제 — �
 
 adb는 `scrcpy_bin/` 안의 것을 먼저 쓰고, 없으면 PATH에서 찾습니다. 서버가 실제로 어느 adb를 쓰는지는 `GET /api/health`의 `adb_path`로 확인할 수 있습니다.
 
+**두 서버가 adb를 찾는 방식이 다릅니다.** `server.py`는 위 순서로 경로를 직접 해석하지만, **ws-scrcpy는 `adb`를 PATH에서 찾아 프로세스로 띄웁니다**(프로토콜을 직접 말하지 않고 바이너리를 실행합니다). 그래서 adb가 `scrcpy_bin/`에만 있으면 대시보드·입력·설치는 다 되는데 미러링만 안 되고, ws-scrcpy 로그에 `spawn adb ENOENT`가 남습니다. `run_root_server.bat`은 `scrcpy_bin/`을 PATH 앞에 붙여 두 서버를 맞춰주지만, `npm start`를 직접 띄운다면 **adb가 PATH에 있어야 합니다.**
+
 오디오 포워딩은 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 2.7 이상 바이너리가 따로 필요합니다(라이선스상 이 저장소에 포함하지 않습니다). `scrcpy_bin/`에 두거나 PATH에 추가하세요. 없으면 오디오 버튼만 503을 반환하고 나머지 기능은 정상 동작합니다.
 
 ```bash
@@ -138,6 +140,8 @@ Get-NetTCPConnection -LocalPort 8010 -State Listen | ForEach-Object { Get-Proces
 ```
 
 점유돼 있으면 `ws-scrcpy.config.json`의 `port`만 비어 있는 값으로 바꾸고 두 서버를 재시작하면 됩니다.
+
+**adb 서버를 재시작한 뒤 미러링이 안 될 때**: `adb kill-server`를 하면 ws-scrcpy가 들고 있던 연결이 끊기고, 그 node 프로세스는 스스로 복구하지 않습니다. 브라우저 콘솔에 `WS closed: socket hang up`이 뜨면 **ws-scrcpy를 재시작**하세요. `[스트림 정리]`로는 안 됩니다 — 그건 기기 쪽 잔존 프로세스를 지우는 버튼이고, 이 경우는 PC 쪽 상태가 문제입니다.
 
 **미러링이 검은 화면이거나 `unknown host service` 오류가 날 때**: ws-scrcpy를 재시작해도 기기 안의 scrcpy 서버 프로세스가 남아 있는 경우가 있습니다. 그 잔존 프로세스가 포트를 쥐고 있으면 새 연결이 붙지 못합니다. 기기 쪽을 정리하고 다시 시도하세요.
 

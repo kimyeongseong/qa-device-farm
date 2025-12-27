@@ -793,6 +793,12 @@ async def get_device_info(serial: str):
         except:
             pass
         
+        # Screen size belongs on a device-farm detail panel -- it is the first
+        # thing you check when a layout bug only shows up on one tablet.
+        # get_device_resolution() answers None for a device that will not say.
+        size = get_device_resolution(serial)
+        width, height = size if size else (0, 0)
+
         info = {
             "model": props.get("ro.product.model"),
             "manufacturer": props.get("ro.product.manufacturer"),
@@ -803,6 +809,10 @@ async def get_device_info(serial: str):
             "current_app": current_app,
             "cpu": props.get("ro.board.platform", "Unknown"),
             "memory": get_total_memory(d),
+            "abi": props.get("ro.product.cpu.abi", "Unknown"),
+            "build_id": props.get("ro.build.display.id") or props.get("ro.build.id", "Unknown"),
+            "width": width,
+            "height": height,
         }
         return JSONResponse(content={"status": "success", "info": info})
     except Exception as e:
