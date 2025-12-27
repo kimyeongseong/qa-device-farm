@@ -139,6 +139,16 @@ Get-NetTCPConnection -LocalPort 8010 -State Listen | ForEach-Object { Get-Proces
 
 If it is taken, change `port` in `ws-scrcpy.config.json` and restart both servers.
 
+**When the mirror suddenly looks worse — somebody else is watching the same device**: with more than one viewer on a device, ws-scrcpy negotiates the stream down to **the smallest window among them**. A colleague opening the same device in a small window drags your picture down with it. Measured: one 385px-wide client pulled a 1600×2560 tablet down to **320×512**, and closing it and reloading restored full size.
+
+PiP inherits this, because the browser sizes the PiP window from the video's **intrinsic** resolution. For a large PiP, make the stream window big before entering it. To pin the resolution instead, set bitrate and maximum size under **⋯ (More)** in the toolbar.
+
+```bash
+adb -s <serial> shell "ps -A | grep app_process"
+```
+
+If the device shows only one stream process and the quality is still low, check for extra browser tabs on the same device.
+
 **When mirroring stops after an adb server restart**: `adb kill-server` drops the connection ws-scrcpy was holding, and its node process does not recover on its own. If the browser console shows `WS closed: socket hang up`, **restart ws-scrcpy**. Reset stream will not help — that clears leftovers on the *device*, and this failure is host-side state.
 
 **When the mirror is black, or the log says `unknown host service`**: restarting ws-scrcpy does not always take down the scrcpy server it pushed onto the device, and the leftover process holds the port so the next connection gets nothing.
