@@ -338,10 +338,10 @@ python tests/run_all.py
 
 ```
 test_leases_and_input.py     ok       26 passed, 0 failed
-test_features.py             ok      193 passed, 0 failed
+test_features.py             ok      194 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
 test_cli.py                  ok       24 passed, 0 failed
-258 passed, 0 failed across 4 suites
+259 passed, 0 failed across 4 suites
 ```
 
 Each suite runs in its own process with a temporary directory as cwd, so one suite's monkeypatching and runtime state (`device_leases.json`, `macros/`) cannot leak into another, and the working tree stays clean.
@@ -378,5 +378,5 @@ The reasoning and the boundaries are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
 - **Authentication is optional and coarse.** Without `DEVICE_FARM_TOKEN`, anyone who can reach the port can drive the devices and install APKs. Fine on an internal network; turn it on before exposing the farm. It is one shared secret, not per-user accounts.
 - **No Korean or emoji input.** `adb shell input text` is ASCII only; the device needs its own IME.
 - **Macros are still coordinate-based.** Resolution differences are corrected by proportional scaling, but devices with a different aspect ratio or a re-flowed layout (foldables, tablets) will not match. It does not find UI elements. Macros recorded before this feature have no resolution and replay unscaled.
-- **The in-memory log buffer is 20k lines per device** and is lost on restart. For long runs enable `to_file` when starting the capture; the full log lands in `logs/`.
+- **The in-memory log buffer is 20k lines per device** and is lost on restart. It fills faster than you would expect — measured at 400–1,000 lines/second at level V on a tablet with an app running, so it wraps in **30–60 seconds**. The log tab warns you (`버퍼 가득 · 오래된 로그 삭제 중`) once it is at the cap, but for a long reproduction enable `to_file` from the start; the full log lands in `logs/`.
 - **PiP is Chromium-only.** Firefox has no such API, so the button does not appear at all. Browser policy requires a real user click to enter it.

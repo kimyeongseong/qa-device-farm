@@ -1606,6 +1606,9 @@ async def get_logcat(serial: str, tail: int = 500, contains: str = None):
         "started": session["started"],
         "total": len(session["lines"]),
         "matched": len(lines),
+        # At the cap the deque is dropping its oldest lines, and the oldest
+        # lines are usually the interesting ones. The UI says so out loud.
+        "capacity": LOGCAT_MAX_LINES,
         "file": session.get("path"),
         "crashes": session["crashes"],
         "lines": lines[-max(1, tail):],

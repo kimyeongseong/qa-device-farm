@@ -182,6 +182,10 @@ r = c.get("/api/logcat/DEV_A?contains=ANR")
 check("contains filter works", r.json()["matched"] == 1, r.text)
 r = c.get("/api/logcat/DEV_A?tail=2")
 check("tail caps output", len(r.json()["lines"]) == 2, r.text)
+# The dashboard warns "버퍼 가득" by comparing total against this, so a read that
+# omits it would silently drop the warning on an all-day capture.
+check("read reports the buffer capacity",
+      r.json()["capacity"] == server.LOGCAT_MAX_LINES, r.text)
 r = c.get("/api/logcat/DEV_A/download")
 check("download is a text attachment",
       r.status_code == 200 and "attachment" in r.headers.get("content-disposition", ""),

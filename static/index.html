@@ -981,6 +981,12 @@
         // --- Logcat ---
         let logPollTimer = null;
         function stopLogPolling() { clearInterval(logPollTimer); logPollTimer = null; }
+        // refreshLog() stops the timer once a capture ends, so [수집 시작] has to
+        // put it back or the panel would sit there frozen on a live capture.
+        function startLogPolling() {
+            stopLogPolling();
+            logPollTimer = setInterval(refreshLog, 2000);
+        }
 
         async function loadLogcat() {
             const div = document.getElementById('logcat-content');
@@ -995,11 +1001,10 @@
                     <input id="log-filter" placeholder="필터 (예: Exception)" oninput="refreshLog()"
                         style="flex:1; min-width:140px; background:#111; border:1px solid #333; color:#ddd; padding:6px; font-family:'JetBrains Mono'; font-size:0.8em;">
                 </div>
-                <div id="log-summary" style="font-family:'JetBrains Mono'; font-size:0.8em; margin-bottom:8px; color:#888;"></div>
+                <div id="log-summary" style="font-family:'JetBrains Mono'; font-size:0.8em; margin-bottom:8px; color:#888;">불러오는 중...</div>
                 <div id="log-body" style="max-height:320px; overflow:auto; background:#0a0a0a; border:1px solid #222; padding:10px;"></div>`;
             refreshLog();
-            stopLogPolling();
-            logPollTimer = setInterval(refreshLog, 2000);
+            startLogPolling();
         }
 
         async function logcatStart() {
@@ -1009,6 +1014,7 @@
             if (!ok) { alert('수집 시작 실패: ' + (data.message || '')); return; }
             if (data.file) alert(`파일로도 저장합니다:
 ${data.file}`);
+            startLogPolling();
             refreshLog();
         }
         async function logcatStop() {
@@ -1039,6 +1045,7 @@ ${data.file}`);
             if (!res.ok) {
                 summary.innerHTML = `<span style="color:#666;">수집 중이 아닙니다. [수집 시작]을 누르세요.</span>`;
                 body.innerHTML = '';
+                stopLogPolling();
                 return;
             }
 
@@ -1047,7 +1054,18 @@ ${data.file}`);
                 ? `<span style="color:#ff6b6b; font-weight:700;">크래시 ${d.crashes.length}건</span>`
                 : `<span style="color:var(--success-color);">크래시 없음</span>`;
             const fileNote = d.file ? ` · <span style="color:#8ef;" title="${d.file}">파일 저장 중</span>` : '';
-            summary.innerHTML = `● 수집 중 · ${d.total}줄${filter ? ` (필터 일치 ${d.matched})` : ''} · ${crashNote}${fileNote}`;
+            // Pressing [중지] used to leave this reading "수집 중", which made the
+            // button look dead. The buffer stays readable either way.
+            const stateNote = d.capturing
+                ? '<span style="color:var(--success-color);">● 수집 중</span>'
+                : '<span style="color:#888;">■ 중지됨 (버퍼는 남아 있음)</span>';
+            // The buffer is a fixed-size ring, so at the cap the start of the run
+            // is already gone -- say so instead of showing a suspiciously round number.
+            const fullNote = (d.capacity && d.total >= d.capacity && !d.file)
+                ? ` · <span style="color:#fc6;" title="긴 재현이면 [파일로 저장]을 켜고 다시 시작하세요.">버퍼 가득 · 오래된 로그 삭제 중</span>`
+                : '';
+            summary.innerHTML = `${stateNote} · ${d.total}줄${filter ? ` (필터 일치 ${d.matched})` : ''} · ${crashNote}${fileNote}${fullNote}`;
+            if (!d.capturing) stopLogPolling();
 
             // Only the tail is rendered; the full buffer is what the download gives you.
             const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
