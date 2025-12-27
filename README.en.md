@@ -366,6 +366,7 @@ What is covered: lease conflicts, TTL expiry and pool exhaustion; input injectio
 - **`/api/health` reports the adb server version.** A second adb at a different version on the machine keeps restarting the server, and every wireless device dies with it — invisible from the client path alone. Below version 41 the response carries an explanation.
 - **A missing adb binary means `degraded`.** adbutils reaches the adb server over TCP, so the device list, device details and thumbnails all work with no adb binary on the machine at all — while everything that shells out (input, app control, install, logcat, wireless, the screenrecord fallback) fails. Reporting only the path let the farm answer `ok` in exactly that state, so the resolved path is checked for existence and `adb_binary` carries what breaks.
 - **Screenshots are serialised per device.** Concurrent screenshot requests to one device make adb unstable, so an `asyncio.Lock` per device lets one through at a time.
+- **adb queries run in a thread.** adbutils is synchronous, and calling it straight from an `async def` handler stalls the event loop — measured, `/api/config`, which only reads a local file, went from 7ms to 750ms while one device was interrogated. On a shared farm that means one person opening a device panel freezes everyone else's dashboard, so anything touching adb goes through `asyncio.to_thread` (10ms under the same load).
 
 The reasoning and the boundaries are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (Korean).
 

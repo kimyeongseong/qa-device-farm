@@ -649,7 +649,16 @@ async def get_devices(refresh: bool = False):
     Details come from a per-device cache so the dashboard's two-second poll
     does not re-interrogate every device over adb; pass `?refresh=1` to force
     a re-read.
+
+    The adb work runs in a thread. adbutils is synchronous, and calling it
+    straight from an async handler blocks the whole event loop -- measured:
+    /api/config, which only reads a local file, went from 7ms to 750ms while one
+    device was being interrogated. On a shared farm that means one person opening
+    a panel freezes everybody else's dashboard.
     """
+    return await asyncio.to_thread(collect_devices, refresh)
+
+def collect_devices(refresh: bool):
     try:
         devices = []
         states = list_device_states()
@@ -769,6 +778,11 @@ async def install_apk(serial: str, file: UploadFile = File(...)):
 
 @app.get("/api/info/{serial}")
 async def get_device_info(serial: str):
+    # Several adb round trips; see collect_devices() on why this cannot run on
+    # the event loop.
+    return await asyncio.to_thread(read_device_info, serial)
+
+def read_device_info(serial: str):
     try:
         d = adb.device(serial=serial)
         props = d.prop
@@ -821,6 +835,9 @@ async def get_device_info(serial: str):
 
 @app.get("/api/packages/{serial}")
 async def get_packages(serial: str):
+    return await asyncio.to_thread(read_packages, serial)
+
+def read_packages(serial: str):
     try:
         d = adb.device(serial=serial)
         # List 3rd party packages
@@ -1102,6 +1119,9 @@ def adb_server_info():
 @app.get("/api/health")
 async def health():
     """Liveness probe: is the server up, and can it still talk to adb?"""
+    return await asyncio.to_thread(check_health)
+
+def check_health():
     try:
         serials = drop_duplicate_transports([d.serial for d in adb.device_list()])
         leased = sum(1 for s in serials if get_lease(s))
