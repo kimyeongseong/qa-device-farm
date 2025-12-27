@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Stream server (ws-scrcpy) configuration. This file is the single place the",
+    "stream port is defined: ws-scrcpy reads it via WS_SCRCPY_CONFIG, and",
+    "server.py reads it to tell the dashboard where the stream server lives.",
+    "Change the port here only -- nothing else needs editing.",
+    "",
+    "Why not 8000: ws-scrcpy's own default is 8000, which collides with a lot of",
+    "development tooling (Unreal Editor, Django, python -m http.server). On",
+    "Windows a process bound to 127.0.0.1:8000 wins over one bound to :: , so the",
+    "dashboard would silently frame that other app's error page instead of the",
+    "mirror. 8010 keeps the default clear of that.",
+    "",
+    "Check a port before using it:",
+    "  Windows  -> Get-NetTCPConnection -LocalPort 8010 -State Listen",
+    "  Linux/mac-> lsof -iTCP:8010 -sTCP:LISTEN"
+  ],
+  "server": [
+    {
+      "secure": false,
+      "port": 8010
+    }
+  ]
+}

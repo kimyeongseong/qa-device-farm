@@ -1,5 +1,10 @@
 # QA Device Farm
 
+한국어 · [English](README.en.md)
+
+**[MIT 라이선스](LICENSE)** — 김영성 &lt;cds04130@kakao.com&gt;
+번들된 서드파티 구성요소는 [NOTICE.md](NOTICE.md), 릴리즈별 변경 사항은 [CHANGELOG.md](CHANGELOG.md)에 있습니다.
+
 USB로 꽂아둔 안드로이드 실기기를, 브라우저와 HTTP API 한 곳에서 공유해서 쓰는 셀프호스팅 디바이스 팜입니다.
 
 QA 업무 중 실기기가 개인 PC에 묶여 있어서 생기던 문제 — 기기를 쓰려면 자리로 가야 하고, 누가 쓰는지 몰라 충돌하고, 자동화는 각자 로컬에서만 돌던 — 를 없애려고 만들었습니다.
@@ -14,7 +19,7 @@ QA 업무 중 실기기가 개인 PC에 묶여 있어서 생기던 문제 — �
                    │
         ┌──────────┴──────────┐
         ▼                     ▼
-   adb (adbutils)      ws-scrcpy (:8000)
+   adb (adbutils)      ws-scrcpy (:8010)
         │               H.264 저지연 미러링
         ▼
    USB / 무선 연결 안드로이드 기기
@@ -26,32 +31,47 @@ QA 업무 중 실기기가 개인 PC에 묶여 있어서 생기던 문제 — �
 
 | | |
 |---|---|
-| **기기 대시보드** | 연결된 기기의 모델·OS·해상도·배터리·IP를 한 화면에서. 기기별 별칭 지정. |
+| **기기 대시보드** | 연결된 기기의 모델·OS·해상도·배터리·RAM·IP를 한 화면에서. 기기별 별칭 지정. USB 승인 대기·offline 기기도 이유와 함께 표시합니다. |
 | **원격 조작** | 화면을 보면서 탭·스와이프·키 입력. 미러링은 ws-scrcpy(H.264), 조작은 adb input. |
 | **점유(Lease)** | 기기를 쓰기 전에 이름을 걸어둡니다. TTL이 있어 죽은 CI 잡이 기기를 영구 점유하지 못합니다. |
 | **다중 기기 배치 작업** | 여러 기기를 체크해서 APK 설치·매크로 재생·앱 제어를 한 번에. 기기별 성공/실패를 따로 보고하고, 남이 점유 중인 기기는 건너뜁니다. |
-| **Logcat 수집 + 크래시 감지** | 기기별로 logcat을 버퍼에 모으고 `FATAL EXCEPTION`·ANR·네이티브 시그널을 자동으로 잡아냅니다. 필터·다운로드 지원. |
+| **Logcat 수집 + 크래시 감지** | 기기별로 logcat을 모으고 `FATAL EXCEPTION`·ANR·네이티브 시그널을 자동 감지. 필터·다운로드, 장시간 실행용 파일 저장 지원. |
 | **매크로 녹화/재생** | 조작을 타임스탬프째 기록해 JSON으로 저장하고 N회 반복 재생. 녹화 해상도를 같이 저장해서 **다른 해상도 기기에서도 좌표를 스케일링**해 재생합니다. |
 | **앱 제어** | 실행·강제종료·데이터 초기화. 테스트 전 상태 리셋에 매번 쓰는 동작들. |
 | **APK 설치/삭제** | 브라우저에서 APK를 드롭하면 선택한 기기에 `install -r`. 서드파티 패키지 목록 조회·삭제. |
 | **무선 디버깅 전환** | 버튼 한 번으로 `tcpip 5555` + `connect`. USB를 뽑아도 유지. |
 | **오디오 포워딩** | scrcpy 바이너리로 기기 소리를 PC로. |
+| **Picture-in-Picture** | 미러링 화면을 항상 위에 뜨는 작은 창으로. 다른 창에서 작업하면서 기기를 계속 보거나, 여러 대를 동시에 띄워둘 수 있습니다. |
 | **CLI / CI 연동** | 세션 개념 없이 HTTP 호출만으로 기기 점유 → 조작 → 로그 확인 → 반납. |
 
 ---
 
 ## 빠르게 실행하기
 
-**필요한 것:** Python 3.10+, Node.js 16+, [Android platform-tools](https://developer.android.com/tools/releases/platform-tools)(adb가 PATH에 있거나 `scrcpy_bin/adb.exe`에 위치), USB 디버깅을 켠 안드로이드 기기.
+**필요한 것:** Python 3.10+, Node.js 16+, [Android platform-tools](https://developer.android.com/tools/releases/platform-tools), USB 디버깅을 켠 안드로이드 기기.
+
+adb는 `scrcpy_bin/` 안의 것을 먼저 쓰고, 없으면 PATH에서 찾습니다. 서버가 실제로 어느 adb를 쓰는지는 `GET /api/health`의 `adb_path`로 확인할 수 있습니다.
+
+오디오 포워딩은 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 2.7 이상 바이너리가 따로 필요합니다(라이선스상 이 저장소에 포함하지 않습니다). `scrcpy_bin/`에 두거나 PATH에 추가하세요. 없으면 오디오 버튼만 503을 반환하고 나머지 기능은 정상 동작합니다.
 
 ```bash
-git clone https://github.com/kimyeongseong/device-farm-server.git
-cd device-farm-server
+git clone https://github.com/kimyeongseong/qa-device-farm.git
+cd qa-device-farm
 
 pip install -r requirements.txt
 
 cd ws-scrcpy && npm install && npm run dist && cd ..
 ```
+
+> **번들된 ws-scrcpy에 대해** — upstream(`2bde541`) 원본 상태로는 최신 Node에서 설치도 빌드도
+> 되지 않았습니다. 이 저장소에는 그 수정이 적용되어 있어 위 명령이 그대로 동작합니다.
+> 무엇을 왜 고쳤는지는 [NOTICE.md](NOTICE.md)에 있습니다. 요점:
+>
+> - 이 팜이 쓰지 않는 iOS/Appium 경로와 브라우저 내 셸을 빌드에서 제외했습니다.
+>   그 결과 의존성 878개 → 446개, 보안 권고 54건(critical 2, high 17) → **0건**.
+> - `node-pty`(2021년판, Node 24에서 네이티브 빌드 실패)가 빠져 별도 빌드 도구 없이 설치됩니다.
+> - upstream의 `package-lock.json`이 자기 `package.json`과 어긋나 `npm ci`가 거부되던 문제도
+>   해결됐습니다.
 
 Windows에서는:
 
@@ -71,6 +91,97 @@ cd ws-scrcpy && npm start
 
 - 대시보드 — http://localhost:8001/
 - API 문서 (자동 생성) — http://localhost:8001/docs
+
+### 접근 토큰
+
+기본은 인증 없음입니다. 신뢰된 사내망이면 그대로 쓰고, 팜을 밖으로 노출할 때 토큰을 켜세요.
+
+```bash
+# Windows
+set DEVICE_FARM_TOKEN=아무거나-긴-임의문자열
+# Linux/mac
+export DEVICE_FARM_TOKEN=아무거나-긴-임의문자열
+```
+
+켜면 API 전체가 `X-Farm-Token` 헤더(또는 `?token=`)를 요구합니다. 대시보드는 처음 한 번 물어보고
+`localStorage`에 담아두며, CLI는 `DEVICE_FARM_TOKEN` 환경변수나 `--token`을 씁니다.
+
+```bash
+DEVICE_FARM_TOKEN=... python cli.py devices
+python cli.py --token ... devices
+```
+
+토큰 없이도 열려 있는 것: 대시보드 페이지와 정적 파일(페이지가 토큰을 물어봐야 하니까),
+그리고 `/api/health` — 모니터링이 생존 확인만 하려고 비밀을 알 필요는 없습니다.
+
+브라우저는 WebSocket에 헤더를 못 실으므로 `/ws/...`는 쿼리스트링으로 토큰을 받습니다.
+같은 이유로 썸네일과 로그 다운로드는 `fetch` 후 blob으로 넘깁니다 — 2초마다 도는 폴링 URL에
+토큰을 붙이면 접근 로그마다 비밀이 남기 때문입니다.
+
+### 포트
+
+| 포트 | 프로세스 | 바꾸는 법 |
+|---|---|---|
+| 8001 | 대시보드·API (`server.py`) | `DEVICE_FARM_PORT` 환경변수 (호스트는 `DEVICE_FARM_HOST`) |
+| 8010 | 스트림 서버 (ws-scrcpy) | **`ws-scrcpy.config.json`** |
+
+포트가 이미 점유돼 있으면 서버가 기동을 거부하고 누가 쓰는지 찾는 명령까지 알려줍니다. 원시 `OSError` 스택트레이스를 보는 것보다 낫고, Windows에서 다른 프로그램이 조용히 대신 응답하는 상황(아래)을 곧바로 드러냅니다.
+
+스트림 포트는 `ws-scrcpy.config.json` **한 곳에서만** 정의합니다. ws-scrcpy는 `WS_SCRCPY_CONFIG` 환경변수로 이 파일을 읽고, `server.py`도 같은 파일을 읽어 `GET /api/config`로 대시보드에 알려줍니다. 포트를 바꿀 때 이 파일만 고치면 됩니다.
+
+ws-scrcpy 기본값인 8000을 쓰지 않는 이유가 있습니다. 8000은 언리얼 에디터·Django·`python -m http.server` 등이 흔히 쓰고, **Windows에서는 `127.0.0.1:8000`에 붙은 프로세스가 `::`에 붙은 프로세스를 이깁니다.** 그러면 대시보드가 미러링 프레임에 그 프로그램의 에러 페이지를 그대로 띄워서, 원인 찾기가 매우 어려워집니다. 실제로 개발 중에 이 상황을 겪었습니다.
+
+**미러링이 안 나올 때**: 스트림 창 상단에 실제로 접속 중인 주소(`호스트:포트`)가 표시됩니다. 그 포트를 다른 프로그램이 쓰고 있는지 확인하세요.
+
+```bash
+Get-NetTCPConnection -LocalPort 8010 -State Listen | ForEach-Object { Get-Process -Id $_.OwningProcess }
+```
+
+점유돼 있으면 `ws-scrcpy.config.json`의 `port`만 비어 있는 값으로 바꾸고 두 서버를 재시작하면 됩니다.
+
+**미러링이 검은 화면이거나 `unknown host service` 오류가 날 때**: ws-scrcpy를 재시작해도 기기 안의 scrcpy 서버 프로세스가 남아 있는 경우가 있습니다. 그 잔존 프로세스가 포트를 쥐고 있으면 새 연결이 붙지 못합니다. 기기 쪽을 정리하고 다시 시도하세요.
+
+```bash
+adb -s <serial> shell "ps -A | grep app_process"
+```
+
+대시보드 기기 카드의 **[스트림 정리]** 버튼이 이걸 대신합니다 (`POST /api/device/{serial}/reset-stream`).
+`app_process`라는 이름만 보고 지우면 다른 앱까지 죽으므로, scrcpy 클래스명으로 정확히 골라 정리합니다.
+기기를 뽑았다 꽂은 뒤에도 자주 발생합니다.
+
+**무선 연결이 자꾸 끊길 때 — adb 버전 충돌**: PC에 adb 바이너리가 여러 개 있고 버전이 다르면,
+서로 상대의 adb 서버를 죽입니다.
+
+```
+adb server version (40) doesn't match this client (41); killing...
+```
+
+`adb connect`로 만든 무선 연결은 **서버 상태**라서 서버가 재시작될 때마다 사라집니다. USB 기기는
+다시 잡히므로 무선만 조용히 빠지는 것처럼 보입니다. 개발 중 SuperDisplay가 자체 adb 1.0.40
+서비스를 계속 띄워 이 문제를 겪었습니다.
+
+```bash
+Get-CimInstance Win32_Process -Filter "Name='adb.exe'" | Select-Object ProcessId, ExecutablePath
+```
+
+여러 경로가 나오면 하나로 통일하세요. 다른 adb를 쓰는 프로그램(스크린 미러링 유틸리티 등)이
+있으면 그 서비스를 끄거나, 같은 버전의 adb를 쓰도록 맞춰야 무선 연결이 유지됩니다.
+
+### Node 없이 쓰는 간이 미러링
+
+ws-scrcpy를 띄우지 않고 `server.py`만으로도 미러링이 됩니다. `adb exec-out screenrecord`의
+H.264를 WebSocket으로 넘겨 브라우저에서 jmuxer로 디코드하는 경로입니다.
+
+```
+http://localhost:8001/control?serial=<serial>&model=<model>
+```
+
+측정값(레노보 TB373FU, USB): 전체 해상도 2944×1840로 재생되고, 조작 → 화면 반영까지
+**약 1.3초**(앱 실행 시간 포함)입니다. 화면을 지켜보는 모니터링에는 충분하지만, 즉각적인
+반응이 필요한 조작에는 ws-scrcpy 경로가 낫습니다.
+
+Node·npm 설치가 어려운 환경, 또는 ws-scrcpy가 죽었을 때의 대체 경로로 쓰세요.
+대시보드 기기 카드의 **[간이 미러링]** 버튼으로 바로 열 수 있습니다.
 
 기기 별칭을 미리 넣어두려면 `device_aliases.example.json`을 `device_aliases.json`으로 복사해서 편집하세요. 이 파일은 실기기 시리얼이 들어가므로 gitignore되어 있습니다.
 
@@ -143,8 +254,9 @@ python cli.py batch-macro --serials R3CN30ABCDE,HA1EJ0000 --name login_flow --co
 
 | Method | Path | 설명 |
 |---|---|---|
-| `GET` | `/api/health` | 서버·adb 상태, 전체/유휴 기기 수 |
-| `GET` | `/api/devices` | 기기 목록 (점유 상태 포함) |
+| `GET` | `/api/health` | 서버·adb 상태, 기기 수, adb 경로·서버 버전 (토큰 불필요) |
+| `GET` | `/api/config` | 대시보드가 알아야 할 값 (스트림 포트) |
+| `GET` | `/api/devices` | 기기 목록 (점유 상태 + `state`/`state_hint`). `?refresh=1` 로 캐시 무시 |
 | `GET` | `/api/device/{serial}/screenshot` | JPEG 스크린샷 |
 | `GET` | `/api/info/{serial}` | 상세 정보 (제조사·CPU·현재 앱·IP) |
 | `POST` | `/api/devices/occupy` | 유휴 기기 아무거나 점유 |
@@ -156,12 +268,18 @@ python cli.py batch-macro --serials R3CN30ABCDE,HA1EJ0000 --name login_flow --co
 | `GET` | `/api/packages/{serial}` | 서드파티 패키지 목록 |
 | `POST` | `/api/uninstall/{serial}` | 패키지 삭제 |
 | `POST` | `/api/app/{serial}/{action}` | 앱 `launch` / `stop` / `clear` |
+| `POST` | `/api/alias/{serial}` | 기기 별칭 지정 (빈 값이면 모델명으로 복원) |
+| `POST` | `/api/audio/start/{serial}` | 기기 소리를 PC로 (scrcpy 바이너리 필요) |
+| `POST` | `/api/audio/stop/{serial}` | 오디오 중지 |
 | `POST` | `/api/wireless/{serial}` | 무선 디버깅 전환 |
+| `POST` | `/api/usb/{serial}` | USB 모드로 복귀 (위의 반대) |
+| `POST` | `/api/device/{serial}/reset-stream` | 기기에 남은 스트림 프로세스 정리 |
 | `POST` | `/api/macros/start_record/{serial}` | 매크로 녹화 시작 (해상도 같이 저장) |
+| `POST` | `/api/macros/stop_record/{serial}` | 녹화 종료 후 이름 지정해 저장 |
 | `POST` | `/api/macros/play/{serial}` | 매크로 재생 (반복 횟수 지정, 좌표 자동 스케일) |
 | `GET` | `/api/macros` | 매크로 목록 + 스텝 수·녹화 해상도 |
 | `DELETE` | `/api/macros/{name}` | 매크로 삭제 |
-| `POST` | `/api/logcat/{serial}/start` | 로그 수집 시작 (`level`, `clear` 지정) |
+| `POST` | `/api/logcat/{serial}/start` | 로그 수집 시작 (`level`, `clear`, `to_file`) |
 | `POST` | `/api/logcat/{serial}/stop` | 수집 중지 |
 | `GET` | `/api/logcat/{serial}` | 버퍼 조회 (`tail`, `contains`) + 감지된 크래시 |
 | `GET` | `/api/logcat/{serial}/download` | 전체 버퍼를 텍스트 파일로 |
@@ -185,15 +303,71 @@ curl -X POST localhost:8001/api/devices/occupy \
 { "status": "success", "serial": "R3CN30ABCDE", "owner": "ci-smoke", "expires_at": 1786000000.0 }
 ```
 
+### 수집한 로그 분석
+
+장시간 캡처는 수만 줄이라 처음부터 읽을 수 없습니다. 실행 후 알고 싶은 것만 뽑아줍니다.
+
+```bash
+python analyze_logs.py logs/logcat_R3CN30_20251228-004055.txt
+```
+
+```
+2264 lines, 2 without a standard header
+
+레벨별            Fatal 상위 태그        크래시
+  F Fatal      1     1  AndroidRuntime     line 1604  [java crash] F/AndroidRuntime(22117): FATAL EXCEPTION: main
+  E Error     46   Error 상위 태그
+  W Warn       1    37  HfLooper
+  D Debug   2183     9  mtk_storageproxyd
+```
+
+크래시가 하나라도 있으면 종료 코드 2로 끝나므로 CI 스텝에서 바로 쓸 수 있습니다.
+
+---
+
+## 테스트
+
+기기 없이 돌아갑니다. adb 계층을 가짜로 바꿔서, 실제 폰이 없어도 전 구간이 검증됩니다.
+
+```bash
+pip install -r requirements-dev.txt
+python tests/run_all.py
+```
+
+```
+test_leases_and_input.py     ok       26 passed, 0 failed
+test_features.py             ok      167 passed, 0 failed
+test_edge_cases.py           ok       15 passed, 0 failed
+test_cli.py                  ok       24 passed, 0 failed
+232 passed, 0 failed across 4 suites
+```
+
+각 스위트는 별도 프로세스에서 임시 디렉터리를 cwd로 잡고 돌기 때문에, 서로의 monkeypatch나
+런타임 상태(`device_leases.json`, `macros/`)가 섞이지 않고 저장소도 오염되지 않습니다.
+
+무엇을 덮는지: 점유 충돌·TTL 만료·풀 고갈, 입력 인젝션 차단, 매크로 해상도 스케일링과 v1 호환,
+경로 탈출 차단, 앱 제어 argv, 크래시 패턴 매칭, logcat 죽은 세션 복구와 파일 저장, 배치 부분 실패 격리,
+무선 시리얼 4종, 기기 정보 캐시, lease 영속화, 접근 토큰 경계, 잔존 스트림 프로세스 선별 종료,
+CLI 전 서브커맨드.
+
+`cli.py`는 실제 서브프로세스로 띄워 검증합니다 — 인프로세스 테스트로는 못 잡는 인자 처리 버그가
+실제로 있었기 때문입니다.
+
+**기기가 있어야만 되는 것**은 자동화하지 않았습니다: 미러링 화질·지연, 오디오, 실제 크래시 감지,
+무선 전환. 이건 실기기로 수동 확인했습니다.
+
 ---
 
 ## 설계 메모
 
-- **세션이 없습니다.** 기기를 조작하려고 세션을 열고 닫지 않습니다. 조작 하나가 HTTP 요청 하나이고, 서버는 요청 사이에 아무것도 붙들지 않습니다. 기기 목록만 adb에서 그때그때 읽습니다.
+- **세션이 없습니다.** 기기를 조작하려고 세션을 열고 닫지 않습니다. 조작 하나가 HTTP 요청 하나이고, 서버는 요청 사이에 기기 세션을 붙들지 않습니다. 상태로 남기는 건 점유(lease)와 폴링용 기기 정보 캐시뿐입니다.
 - **점유는 시한부입니다.** lease에 TTL이 있어서, 잡은 쪽이 죽어도 기기가 알아서 풀립니다.
 - **점유를 강제하는 범위를 나눴습니다.** 화면을 보고 탭하는 실시간 조작(WebSocket)은 막지 않고 대시보드에 점유자만 표시합니다 — 사람이 급히 확인해야 할 때 락에 막히면 곤란하니까요. 반면 되돌릴 수 없는 HTTP 동작(입력 API, 앱 제어, 배치 전부)은 점유를 강제합니다. 남의 CI가 도는 기기의 앱 데이터를 지우면 그 회차가 통째로 날아갑니다.
 - **배치는 부분 실패를 인정합니다.** 열 대에 돌리면 한 대는 빠져 있거나 남이 쓰고 있습니다. 전체를 실패시키는 대신 기기별로 `success` / `error` / `skipped`를 따로 돌려주고, 하나라도 성하지 않으면 `partial`로 표시합니다.
 - **입력은 셸을 거치지 않습니다.** 좌표와 키코드는 정수로 파싱한 뒤 adb에 argv로 넘깁니다. 문자열을 조립해 셸에 던지지 않습니다.
+- **기기 정보는 캐시합니다.** 대시보드가 2초마다 폴링하는데, 기기 하나를 adb로 캐묻는 데 실측 0.8~2.6초가 걸립니다. 폴링 주기보다 느린 데다 기기 수에 비례해 늘어나서, 팜이 커질수록 먼저 무너지는 지점입니다. 모델·해상도·SDK는 연결 중 바뀌지 않으니 한 번만 읽고, 배터리(20초)·IP(60초)만 짧게 캐시합니다. 폴링 응답이 **0.8~2.6초 → 약 25ms**가 됐습니다. 최신값이 필요하면 `?refresh=1`.
+- **점유는 파일로 남습니다.** `device_leases.json`에 기록해서 서버를 재시작해도 유지됩니다. 재시작은 하필 가장 곤란한 순간에 일어납니다 — 기기를 잡고 있는 CI 잡은 계속 돌고 있는데, 팜만 그 기기를 유휴로 착각하는 상황이니까요. 서버가 죽어 있는 동안 만료된 lease는 복원하지 않습니다.
+- **`/api/health`가 adb 서버 버전을 보고합니다.** 클라이언트 경로만으로는 드러나지 않는 문제가 있습니다 — 머신에 다른 버전의 adb가 있으면 서로 서버를 죽이고, 그때마다 무선 연결이 전부 끊깁니다. 41 미만이면 경고 문구가 함께 나옵니다.
 - **기기당 스크린샷 직렬화.** 같은 기기에 스크린샷 요청이 겹치면 adb가 불안정해져서, 기기별 `asyncio.Lock`으로 한 번에 하나만 통과시킵니다.
 
 설계 배경과 한계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)에 정리했습니다.
@@ -203,20 +377,14 @@ curl -X POST localhost:8001/api/devices/occupy \
 ## 알려진 한계
 
 - **안드로이드 전용입니다.** iOS는 지원하지 않습니다.
-- **인증이 없습니다.** 신뢰할 수 있는 네트워크 안에서만 쓰세요. `0.0.0.0:8001`에 붙고 인증 계층이 없어서, 접근할 수 있는 사람은 누구나 기기를 조작하고 APK를 설치할 수 있습니다. 공개 노출은 터널 앞단에 인증을 두는 것을 전제로 합니다.
+- **인증은 선택입니다.** `DEVICE_FARM_TOKEN`을 설정하지 않으면 접근 가능한 누구나 기기를 조작하고 APK를 설치할 수 있습니다. 사내망 전용이면 그대로도 되지만, 밖으로 노출한다면 반드시 켜세요. 공유 비밀 하나이지 사용자별 계정이 아닙니다.
 - **한글·이모지 입력이 안 됩니다.** `adb shell input text`가 ASCII만 받습니다. 기기에 별도 IME를 붙여야 합니다.
 - **매크로는 여전히 좌표 기반입니다.** 해상도 차이는 비례 스케일링으로 보정하지만, 화면비가 다르거나 레이아웃 자체가 바뀌는 기기(폴더블, 태블릿)에서는 어긋납니다. UI 요소를 찾아 누르는 방식이 아닙니다. 녹화 전에 저장된 v1 매크로는 해상도 정보가 없어 스케일 없이 재생됩니다.
-- **로그 버퍼는 메모리에 있고 기기당 2만 줄입니다.** 넘치면 오래된 줄부터 버려집니다. 길게 돌릴 때는 중간중간 다운로드하세요. 서버를 재시작하면 사라집니다.
-- **점유 상태도 메모리에만 있습니다.** 서버를 재시작하면 lease가 전부 사라집니다.
+- **메모리 로그 버퍼는 기기당 2만 줄입니다.** 넘치면 오래된 줄부터 버려지고 서버 재시작 시 사라집니다. 장시간 실행이면 수집 시작할 때 `to_file`(대시보드의 '파일로 저장')을 켜세요 — `logs/` 에 전체가 남습니다.
+- **PiP는 Chromium 계열에서만 됩니다.** Firefox는 이 API가 없어서 버튼이 아예 나타나지 않습니다. 브라우저 정책상 사용자가 직접 클릭해야 진입합니다(스크립트 클릭으로는 안 됩니다).
 
 ---
 
 ## 참고
 
 기기 점유(lease) 모델과 세션 없는 조작 API는 [토스의 디바이스 팜 Nebula 아티클](https://toss.tech/article/device-farm-nebula)을 참고해 이 프로젝트 규모에 맞게 축소 적용했습니다. Nebula가 다루는 분산 락·에이전트 계층·iOS 미러링·자체 드라이버는 이 저장소의 범위 밖입니다.
-
----
-
-## 라이선스
-
-MIT — 김영성. 번들된 서드파티 구성요소는 [NOTICE.md](NOTICE.md)를 참고하세요.

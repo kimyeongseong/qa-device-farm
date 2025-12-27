@@ -13,11 +13,13 @@ ws-scrcpy/build/
 
 # Local runtime state (device serials, recorded macros, uploads)
 device_aliases.json
+device_leases.json
 macros/*.json
 temp_*.apk
 screenshots/
 scrcpy_bin/
 *.log
+logs/
 
 # Local deployment config (tunnel hostnames)
 static/stream-config.js

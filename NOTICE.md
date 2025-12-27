@@ -9,15 +9,31 @@ to their files, not the MIT license in `LICENSE`.
 - License: MIT — Copyright (C) 2021 by Netris, JSC. See `ws-scrcpy/LICENSE`.
 - Vendored at commit `2bde541`.
 
-Local modifications, both under `ws-scrcpy/src/app/`:
+### Local modifications
+
+**Features** — under `ws-scrcpy/src/app/`:
 
 | File | Change |
 |---|---|
-| `index.ts` | Forces the stream defaults this farm runs on (720p bound, 7 Mbps, 60 fps, 10-frame I-frame interval, fit-to-screen) instead of the upstream prompt, and instantiates `MacroController`. |
-| `MacroController.ts` | New file. An in-player macro panel. **Currently disabled** — `initUI()` returns before injecting anything and the body is commented out, because macro control was moved to the main dashboard. Kept for reference. |
+| `index.ts` | Forces the stream defaults this farm runs on (720p bound, 7 Mbps, 60 fps, 10-frame I-frame interval, fit-to-screen) instead of the upstream prompt, and instantiates `PipController`. |
+| `PipController.ts` | New file. A floating Picture-in-Picture button, so a device stays visible while the operator works in another window and several devices can be watched at once. Hands the MSE `<video>` straight to PiP; for the canvas decoders (Broadway, TinyH264, WebCodecs, MJPEG) it bridges `canvas.captureStream()` through a hidden video, since PiP only accepts video elements. |
+
+**Build repair** — upstream at this commit cannot be installed or built on a
+current Node. Every change below exists to fix that, and each one is scoped to
+code this farm does not ship:
+
+| File | Change | Why |
+|---|---|---|
+| `build.config.override.json` | `INCLUDE_APPL: false`, `INCLUDE_ADB_SHELL: false` | This farm is Android-only and exposes device shells through its own API, so neither the iOS/Appium server nor the in-browser xterm shell is built. |
+| `package.json` | Dropped `node-pty`, `xterm`, `xterm-addon-attach`, `xterm-addon-fit`, `ios-device-lib`, `appium-xcuitest-driver` | `node-pty@0.10` (2021) needs a native build that fails on Node 24, which made `npm install` impossible. The rest belong to the two features switched off above. `appium-xcuitest-driver`, hidden in `optionalDependencies`, was the sole source of every remaining advisory: removing these took the dependency tree from 878 packages / 54 advisories (2 critical, 17 high) to 446 packages / 0. |
+| `package-lock.json` | Regenerated | Upstream's lock did not match its own `package.json`, so `npm ci` refused to run at all. |
+| `webpack/ws-scrcpy.common.ts` | `ts-loader` gets `transpileOnly: true` | ts-loader type-checks the whole program from `tsconfig.json`'s `include`, which covers the iOS server that `INCLUDE_APPL: false` already strips from the bundle. Its five pre-existing type errors made webpack's production mode emit nothing, so `npm run dist` produced an empty `dist/`. `npm run lint` still type-lints the code this project owns. |
+
+`MacroController.ts` was removed; it was a disabled in-player macro panel whose
+body was entirely commented out, and macro control lives on the dashboard.
 
 `ws-scrcpy/dist/` and `ws-scrcpy/node_modules/` are build output and are not
-committed; run `npm install && npm run dist` inside `ws-scrcpy/` to rebuild.
+committed.
 
 ## scrcpy server binary (`ws-scrcpy/vendor/Genymobile/scrcpy/`)
 

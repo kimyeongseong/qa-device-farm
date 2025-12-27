@@ -5,7 +5,7 @@ import { Tool } from './client/Tool';
 import Util from './Util';
 import VideoSettings from './VideoSettings';
 import Size from './Size';
-import { MacroController } from './MacroController';
+import { PipController } from './PipController';
 
 window.onload = async function (): Promise<void> {
     const hash = location.hash.replace(/^#!/, '');
@@ -51,10 +51,11 @@ window.onload = async function (): Promise<void> {
 
         StreamClientScrcpy.start(parsedQuery, undefined, undefined, fitToScreen, videoSettings);
 
-        // Initialize Macro Controller (Modular)
+        // Picture-in-Picture control: keeps this device visible while the
+        // operator works elsewhere, and lets several devices be watched at once.
         const serial = parsedQuery.get('udid');
         if (serial) {
-            new MacroController(serial);
+            new PipController(serial);
         }
 
         return;

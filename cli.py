@@ -21,6 +21,13 @@ import requests
 
 DEFAULT_BASE = "http://localhost:8001"
 
+# Set DEVICE_FARM_TOKEN when the farm requires one; --token overrides it. Taking
+# it from the environment keeps the secret out of CI logs and shell history.
+TOKEN = os.environ.get("DEVICE_FARM_TOKEN", "").strip()
+
+def auth_headers():
+    return {"X-Farm-Token": TOKEN} if TOKEN else {}
+
 
 def split_serials(raw):
     serials = [s.strip() for s in raw.split(",") if s.strip()]
@@ -32,7 +39,8 @@ def split_serials(raw):
 def call(base, method, path, payload=None):
     url = f"{base}{path}"
     try:
-        resp = requests.request(method, url, json=payload, timeout=30)
+        resp = requests.request(method, url, json=payload,
+                                headers=auth_headers(), timeout=30)
     except requests.RequestException as e:
         sys.exit(f"cannot reach farm at {base}: {e}")
 
@@ -53,6 +61,7 @@ def call(base, method, path, payload=None):
 def main():
     p = argparse.ArgumentParser(description="QA Device Farm CLI")
     p.add_argument("--base", default=DEFAULT_BASE, help=f"farm URL (default {DEFAULT_BASE})")
+    p.add_argument("--token", help="access token (default: $DEVICE_FARM_TOKEN)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("devices", help="list connected devices")
@@ -103,7 +112,7 @@ def main():
     appc.add_argument("--package", required=True)
     appc.add_argument("--owner")
 
-    macros = sub.add_parser("macros", help="list saved macros")
+    sub.add_parser("macros", help="list saved macros")
 
     macrm = sub.add_parser("macro-delete")
     macrm.add_argument("--name", required=True)
@@ -116,6 +125,9 @@ def main():
     log.add_argument("--lines", type=int, default=200)
     log.add_argument("--out", default=None, help="file for `save` (default logcat_<serial>.txt)")
     log.add_argument("--owner")
+    log.add_argument("--to-file", action="store_true",
+                     help="also write the capture to logs/ on the server "
+                          "(the memory buffer is capped and drops old lines)")
 
     # Batch verbs take --serials as a comma-separated list.
     bapp = sub.add_parser("batch-app")
@@ -136,6 +148,9 @@ def main():
     bins.add_argument("--owner")
 
     a = p.parse_args()
+    global TOKEN
+    if a.token:
+        TOKEN = a.token.strip()
 
     if a.cmd == "devices":
         return call(a.base, "GET", "/api/devices")
@@ -154,7 +169,7 @@ def main():
 
     if a.cmd == "screenshot":
         url = f"{a.base}/api/device/{a.serial}/screenshot"
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(url, headers=auth_headers(), timeout=30)
         if not resp.ok:
             sys.exit(f"screenshot failed: {resp.status_code}")
         with open(a.out, "wb") as f:
@@ -180,14 +195,15 @@ def main():
         if not a.serial:
             sys.exit("logcat %s needs --serial" % a.action)
         if a.action == "start":
-            body = {"clear": True, "level": a.level}
+            body = {"clear": True, "level": a.level, "to_file": a.to_file}
             if a.owner:
                 body["owner"] = a.owner
             return call(a.base, "POST", f"/api/logcat/{a.serial}/start", body)
         if a.action == "stop":
             return call(a.base, "POST", f"/api/logcat/{a.serial}/stop", {})
         if a.action == "save":
-            resp = requests.get(f"{a.base}/api/logcat/{a.serial}/download", timeout=60)
+            resp = requests.get(f"{a.base}/api/logcat/{a.serial}/download",
+                                headers=auth_headers(), timeout=60)
             if not resp.ok:
                 sys.exit(f"download failed: {resp.status_code} {resp.text[:200]}")
             out = a.out or f"logcat_{a.serial}.txt"
@@ -200,7 +216,8 @@ def main():
         params = {"tail": a.lines}
         if a.contains:
             params["contains"] = a.contains
-        resp = requests.get(f"{a.base}/api/logcat/{a.serial}", params=params, timeout=30)
+        resp = requests.get(f"{a.base}/api/logcat/{a.serial}", params=params,
+                            headers=auth_headers(), timeout=30)
         if not resp.ok:
             sys.exit(f"not capturing on {a.serial} (start it first)")
         d = resp.json()
@@ -231,7 +248,8 @@ def main():
             data["owner"] = a.owner
         with open(a.apk, "rb") as fh:
             resp = requests.post(f"{a.base}/api/batch/install", data=data,
-                                 files={"file": (os.path.basename(a.apk), fh)}, timeout=600)
+                                 files={"file": (os.path.basename(a.apk), fh)},
+                                 headers=auth_headers(), timeout=600)
         body = resp.json()
         print(json.dumps(body, indent=2, ensure_ascii=False))
         # A partial batch is a failure for a pipeline, even though HTTP said 200.
@@ -239,14 +257,21 @@ def main():
             sys.exit(1)
         return body
 
-    payloads = {
-        "tap": {"type": "tap", "x": a.x, "y": a.y},
-        "swipe": {"type": "swipe", "x1": a.x1, "y1": a.y1, "x2": a.x2, "y2": a.y2,
-                  "duration": a.duration},
-        "key": {"type": "key", "keycode": a.keycode},
-        "text": {"type": "text", "text": a.value},
-    }
-    payload = payloads[a.cmd]
+    # Build only the payload for the command that ran. Each input subparser
+    # declares its own arguments, so touching another one's (a.x for `key`)
+    # raises AttributeError before anything is sent.
+    if a.cmd == "tap":
+        payload = {"type": "tap", "x": a.x, "y": a.y}
+    elif a.cmd == "swipe":
+        payload = {"type": "swipe", "x1": a.x1, "y1": a.y1,
+                   "x2": a.x2, "y2": a.y2, "duration": a.duration}
+    elif a.cmd == "key":
+        payload = {"type": "key", "keycode": a.keycode}
+    elif a.cmd == "text":
+        payload = {"type": "text", "text": a.value}
+    else:
+        sys.exit(f"unhandled command: {a.cmd}")
+
     if a.owner:
         payload["owner"] = a.owner
     return call(a.base, "POST", f"/api/device/{a.serial}/input", payload)

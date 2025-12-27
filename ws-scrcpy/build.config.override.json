@@ -1,1 +1,4 @@
-{}
+{
+  "INCLUDE_APPL": false,
+  "INCLUDE_ADB_SHELL": false
+}

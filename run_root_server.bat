@@ -8,16 +8,28 @@ cd /d "%~dp0"
 where python >nul 2>&1 || (echo [ERROR] python not found on PATH & pause & exit /b 1)
 where npm    >nul 2>&1 || (echo [ERROR] npm not found on PATH & pause & exit /b 1)
 
+:: Access token. Leave unset on a trusted network; set it before exposing the
+:: farm and every API call then needs it. See "접근 토큰" in the README.
+:: set "DEVICE_FARM_TOKEN=put-a-long-random-string-here"
+
+:: The stream port is defined once, in ws-scrcpy.config.json. ws-scrcpy reads it
+:: through this variable; server.py reads the same file to tell the dashboard.
+set "WS_SCRCPY_CONFIG=%~dp0ws-scrcpy.config.json"
+if not exist "%WS_SCRCPY_CONFIG%" (
+    echo [WARN] ws-scrcpy.config.json missing - ws-scrcpy will fall back to port 8000,
+    echo        which collides with common dev tooling. See the README.
+)
+
 :: Start Backend (Python FastAPI)
 start "Backend Server (8001)" cmd /k "python server.py"
 
 :: Start Frontend (Node.js / ws-scrcpy)
-start "Frontend Server (8000)" cmd /k "cd /d "%~dp0ws-scrcpy" && npm start"
+start "Stream Server" cmd /k "cd /d "%~dp0ws-scrcpy" && npm start"
 
 echo Servers are starting...
 echo ===================================================
 echo [MAIN DASHBOARD]: http://localhost:8001/
 echo [API DOCS]:       http://localhost:8001/docs
-echo [Stream Server]:  http://localhost:8000 (Internal)
+echo [Stream Server]:  see ws-scrcpy.config.json (default 8010, internal)
 echo ===================================================
 echo Don't close this window.

@@ -1,0 +1,4 @@
+# Test-only dependencies. Runtime needs are in requirements.txt.
+-r requirements.txt
+
+httpx        # fastapi.testclient speaks to the app through httpx

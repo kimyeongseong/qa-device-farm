@@ -29,7 +29,16 @@ export const common = () => {
                 {
                     test: /\.tsx?$/,
                     use: [
-                        { loader: 'ts-loader' },
+                        // transpileOnly: ts-loader otherwise type-checks the whole
+                        // program from tsconfig's include, which pulls in upstream
+                        // code this build does not ship (the iOS/Appium server under
+                        // src/server/appl-device). Its five pre-existing strict-null
+                        // and missing-@types errors made webpack's production mode
+                        // refuse to emit anything at all, so `npm run dist` produced
+                        // an empty dist/. Transpiling without the whole-program check
+                        // lets the build succeed; `npm run lint` still type-lints the
+                        // code this project actually owns.
+                        { loader: 'ts-loader', options: { transpileOnly: true } },
                         {
                             loader: 'ifdef-loader',
                             options: buildConfigOptions,

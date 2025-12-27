@@ -127,6 +127,32 @@
             animation: pulseDot 2s infinite;
         }
 
+        /* The header used to read "시스템 정상 가동" as fixed text, so it stayed
+           green while adb was down. These states come from /api/health. */
+        .system-status.warn {
+            color: #ff9f43;
+            background: rgba(255, 159, 67, 0.06);
+            border-color: rgba(255, 159, 67, 0.3);
+            box-shadow: 0 0 15px rgba(255, 159, 67, 0.08);
+        }
+
+        .system-status.warn .status-dot {
+            background: #ff9f43;
+            box-shadow: 0 0 10px #ff9f43;
+        }
+
+        .system-status.down {
+            color: #ff6b6b;
+            background: rgba(255, 107, 107, 0.06);
+            border-color: rgba(255, 107, 107, 0.35);
+            box-shadow: 0 0 15px rgba(255, 107, 107, 0.1);
+        }
+
+        .system-status.down .status-dot {
+            background: #ff6b6b;
+            box-shadow: 0 0 10px #ff6b6b;
+        }
+
         @keyframes pulseDot {
             0% {
                 opacity: 1;
@@ -418,9 +444,9 @@
             <div style="font-size:0.8em; color:#666; font-family:'JetBrains Mono'; margin-top:5px; letter-spacing:1px;">
                 MANAGED BY QA TEAM</div>
         </div>
-        <div class="system-status">
-            <div class="status-dot"></div>
-            시스템 정상 가동
+        <div class="system-status" id="farm-status" title="">
+            <div class="status-dot" id="status-dot"></div>
+            <span id="status-text">상태 확인 중…</span>
         </div>
     </div>
 
@@ -580,7 +606,7 @@
         let currentSerial = '';
         async function fetchDevices() {
             try {
-                const res = await fetch('/api/devices');
+                const res = await apiFetch('/api/devices');
                 const data = await res.json();
                 if (data.devices) renderDevices(data.devices);
             } catch (e) {
@@ -588,14 +614,39 @@
             }
         }
 
-        // Who currently holds the device, and for how much longer.
+        // An <img src> cannot carry the token header, so fetch the frame and hand
+        // the element a blob. Putting ?token= on the URL would work too, but this
+        // poll runs every two seconds -- the secret would end up in every access
+        // log line and in browser history.
+        async function refreshThumb(img, serial) {
+            if (!img) return;
+            try {
+                const res = await apiFetch(`/api/device/${serial}/screenshot?t=${Date.now()}`);
+                if (!res.ok) return;            // 503 while the device is busy: next poll retries
+                const url = URL.createObjectURL(await res.blob());
+                const previous = img.dataset.blobUrl;
+                img.src = url;
+                img.dataset.blobUrl = url;
+                if (previous) URL.revokeObjectURL(previous);
+            } catch (e) {
+                /* transient; the next poll tries again */
+            }
+        }
+
+        // Who currently holds the device, and for how much longer. An attached
+        // but unusable device says why instead of pretending to be idle.
         function leaseBadge(dev) {
+            if (dev.state && dev.state !== 'device') {
+                return `<span style="color:#ff9f43;" title="${dev.state}">⚠ ${dev.state_hint || dev.state}</span>`;
+            }
             if (!dev.occupied_by) {
                 return `<span style="color:var(--success-color);">● IDLE</span>`;
             }
             const left = Math.max(0, Math.round((dev.occupied_until - Date.now() / 1000) / 60));
             return `<span style="color:#ffb454;" title="점유 중">🔒 ${dev.occupied_by} <span style="color:#666;">${left}m</span></span>`;
         }
+
+        const isUsable = dev => !dev.state || dev.state === 'device';
 
         function renderDevices(devices) {
             const container = document.getElementById('device-container');
@@ -620,7 +671,6 @@
 
             devices.forEach((dev, index) => {
                 let card = document.getElementById(`card-${dev.serial}`);
-                const ts = new Date().getTime();
 
                 // Audio State
                 const isAudio = window[`audio_${dev.serial}`];
@@ -631,10 +681,10 @@
                 const displayName = (dev.alias && dev.alias !== dev.model) ? `${dev.alias} <span style='font-size:0.7em; color:#666;'>(${dev.model})</span>` : dev.model;
 
                 if (card) {
+                    // An unusable device has no screen to poll; leave its
+                    // placeholder alone rather than hammering a failing endpoint.
                     const img = card.querySelector('.device-thumb');
-                    const newImg = new Image();
-                    newImg.onload = () => { img.src = newImg.src; };
-                    newImg.src = `/api/device/${dev.serial}/screenshot?t=${ts}`;
+                    if (img && isUsable(dev)) refreshThumb(img, dev.serial);
                     const battery = card.querySelector('.battery-info');
                     if (battery) battery.innerText = `${dev.battery || '?'}`;
                     const lease = card.querySelector('.lease-info');
@@ -658,13 +708,19 @@
                     card.id = `card-${dev.serial}`;
                     card.setAttribute('ondrop', `dropHandler(event, '${dev.serial}')`);
                     card.setAttribute('ondragover', 'dragOverHandler(event)');
+                    // Unusable devices get no screenshot, no batch checkbox and
+                    // no controls -- only the reason they cannot be used.
+                    const usable = isUsable(dev);
+                    const thumb = usable
+                        ? `<img class="device-thumb" alt="" onclick="openControl('${dev.serial}', '${dev.model}')">`
+                        : `<div class="device-thumb" style="display:flex; align-items:center; justify-content:center; background:#151515; color:#ff9f43; font-size:2.4em;">⚠</div>`;
                     card.innerHTML = `
                          <div style="position:relative;">
                              <div style="position:absolute; top:5px; left:5px; background:rgba(0,0,0,0.7); color:#0f0; padding:2px 6px; font-size:0.8em; border-radius:4px; border:1px solid #0f0; z-index:10;">No.${index + 1}</div>
-                             <input type="checkbox" class="batch-check" title="일괄 작업 대상으로 선택"
+                             ${usable ? `<input type="checkbox" class="batch-check" title="일괄 작업 대상으로 선택"
                                     ${batchSelected.has(dev.serial) ? 'checked' : ''}
-                                    onchange="toggleBatch('${dev.serial}', this.checked)">
-                             <img class="device-thumb" src="/api/device/${dev.serial}/screenshot" onclick="openControl('${dev.serial}', '${dev.model}')">
+                                    onchange="toggleBatch('${dev.serial}', this.checked)">` : ''}
+                             ${thumb}
                         </div>
                         <div class="card-header">
                             ${displayName} <span onclick="editAlias('${dev.serial}', '${dev.alias || dev.model}')" style="cursor:pointer; font-size:0.8em; margin-left:5px;">✏️</span>
@@ -674,9 +730,20 @@
                             <span class="battery-info" style="color:${(dev.battery === '100%') ? 'var(--success-color)' : '#aaa'}">${dev.battery}</span>
                         </div>
                         <div class="lease-info" style="margin-bottom:15px; font-size:0.8em; font-family:'JetBrains Mono';">${leaseBadge(dev)}</div>
-                        <button class="btn btn-manage" onclick="openManage('${dev.serial}', '${dev.model}')">⚙️ 시스템 관리 (앱)</button>
+                        ${usable
+                            ? `<button class="btn btn-manage" onclick="openManage('${dev.serial}', '${dev.model}')">⚙️ 시스템 관리 (앱)</button>
+                               <div style="display:flex; gap:6px; margin-top:6px;">
+                                 <button class="btn btn-delete" style="flex:1; color:#8ef; border-color:#356;"
+                                   title="ws-scrcpy 없이 Python 서버만으로 보는 저지연 대체 화면"
+                                   onclick="openSimpleMirror('${dev.serial}', '${dev.model}')">간이 미러링</button>
+                                 <button class="btn btn-delete" style="flex:1; color:#fc8; border-color:#653;"
+                                   title="미러가 검은 화면일 때: 기기에 남은 스트림 프로세스를 정리합니다"
+                                   onclick="resetStream('${dev.serial}')">스트림 정리</button>
+                               </div>`
+                            : `<button class="btn btn-manage" disabled style="opacity:0.4; cursor:not-allowed;">사용 불가</button>`}
                     `;
                     container.appendChild(card);
+                    if (usable) refreshThumb(card.querySelector('.device-thumb'), dev.serial);
                 }
             });
         }
@@ -686,6 +753,20 @@
             // Open the Custom Wrapper Page (Stream + Audio)
             const url = `/static/stream.html?serial=${serial}&model=${encodeURIComponent(model)}`;
             window.open(url, '_blank', 'width=500,height=850,location=no,status=no,resizable=yes');
+        }
+
+        // Mirroring without ws-scrcpy: server.py streams `adb screenrecord`
+        // straight to the browser. Lower quality and about a second behind, but
+        // it needs no Node, so it still works when the stream server is down.
+        function openSimpleMirror(serial, model = 'Device') {
+            const url = `/control?serial=${serial}&model=${encodeURIComponent(model)}`;
+            window.open(url, '_blank', 'width=520,height=900,location=no,status=no,resizable=yes');
+        }
+
+        async function resetStream(serial) {
+            const { ok, data } = await postJson(`/api/device/${serial}/reset-stream`, {});
+            alert(ok ? (data.message || '정리했습니다.')
+                     : `정리 실패: ${data.message || '알 수 없는 오류'}`);
         }
 
         function openManage(serial, model) {
@@ -714,7 +795,7 @@
         async function loadInfo() {
             const div = document.getElementById('info-content');
             div.innerHTML = '스캔 중...';
-            const res = await fetch(`/api/info/${currentSerial}`);
+            const res = await apiFetch(`/api/info/${currentSerial}`);
             const data = await res.json();
             if (data.status === 'success') {
                 const i = data.info;
@@ -736,7 +817,7 @@
             if (newName === null) return; // Cancelled
 
             try {
-                const res = await fetch(`/api/alias/${serial}`, {
+                const res = await apiFetch(`/api/alias/${serial}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: newName })
@@ -759,7 +840,7 @@
             if (!isPlaying) {
                 // START
                 if (!confirm("PC 스피커로 소리를 재생합니다.\n(작은 오디오 창이 뜹니다. 닫지 마세요!)")) return;
-                const res = await fetch(`/api/audio/start/${currentSerial}`, { method: 'POST' });
+                const res = await apiFetch(`/api/audio/start/${currentSerial}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'success') {
                     window[`audio_${currentSerial} `] = true;
@@ -767,7 +848,7 @@
                 } else alert("오류: " + data.message);
             } else {
                 // STOP
-                const res = await fetch(`/api/audio/stop/${currentSerial}`, { method: 'POST' });
+                const res = await apiFetch(`/api/audio/stop/${currentSerial}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'success') {
                     window[`audio_${currentSerial} `] = false;
@@ -776,9 +857,41 @@
             }
             loadInfo(); // Refresh UI
         }
+        // --- Access token ---
+        // The farm only asks for one when DEVICE_FARM_TOKEN is set on the
+        // server. Kept in localStorage so a reload does not re-prompt, and
+        // attached to every request through the wrapper below rather than at
+        // each call site, so a new endpoint cannot forget it.
+        const TOKEN_KEY = 'farmToken';
+        function farmToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+
+        function authHeaders(extra) {
+            const h = Object.assign({}, extra || {});
+            const t = farmToken();
+            if (t) h['X-Farm-Token'] = t;
+            return h;
+        }
+
+        async function apiFetch(url, options) {
+            const opts = Object.assign({}, options || {});
+            opts.headers = authHeaders(opts.headers);
+            const res = await fetch(url, opts);
+            if (res.status === 401) promptForToken();
+            return res;
+        }
+
+        function promptForToken() {
+            const t = prompt('이 팜은 접근 토큰이 필요합니다.\n서버의 DEVICE_FARM_TOKEN 값을 입력하세요.',
+                             farmToken());
+            if (t === null) return false;
+            localStorage.setItem(TOKEN_KEY, t.trim());
+            location.reload();
+            return true;
+        }
+
         // Small helper so every JSON POST sends the right content type.
         async function postJson(url, body) {
-            const res = await fetch(url, {
+            const res = await apiFetch(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body || {})
@@ -789,7 +902,7 @@
         async function loadApps() {
             const div = document.getElementById('apps-content');
             div.innerHTML = '패키지 목록 불러오는 중...';
-            const res = await fetch(`/api/packages/${currentSerial}`);
+            const res = await apiFetch(`/api/packages/${currentSerial}`);
             const data = await res.json();
             div.innerHTML = '';
             if (!data.packages || data.packages.length === 0) {
@@ -829,7 +942,7 @@
         async function loadMacros() {
             const div = document.getElementById('macros-content');
             div.innerHTML = '매크로 DB 로딩 중...';
-            const res = await fetch('/api/macros');
+            const res = await apiFetch('/api/macros');
             const data = await res.json();
             div.innerHTML = '';
             const list = data.details || [];
@@ -852,7 +965,7 @@
 
         async function deleteMacro(name) {
             if (!confirm(`${name} 매크로를 삭제하시겠습니까? 되돌릴 수 없습니다.`)) return;
-            const res = await fetch(`/api/macros/${encodeURIComponent(name)}`, { method: 'DELETE' });
+            const res = await apiFetch(`/api/macros/${encodeURIComponent(name)}`, { method: 'DELETE' });
             if (!res.ok) {
                 const d = await res.json().catch(() => ({}));
                 alert('삭제 실패: ' + (d.message || res.status));
@@ -869,6 +982,9 @@
             div.innerHTML = `
                 <div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; align-items:center;">
                     <button class="btn btn-delete" style="color:#8f8; border-color:#363;" onclick="logcatStart()">수집 시작</button>
+                    <label style="font-size:0.75em; color:#888; display:flex; align-items:center; gap:4px; cursor:pointer;"
+                        title="메모리 버퍼는 2만 줄에서 오래된 로그를 버립니다. 장시간 실행이면 켜세요.">
+                        <input type="checkbox" id="log-to-file"> 파일로 저장</label>
                     <button class="btn btn-delete" style="color:#ccc; border-color:#555;" onclick="logcatStop()">중지</button>
                     <button class="btn btn-delete" style="color:#8ef; border-color:#356;" onclick="logcatDownload()">다운로드</button>
                     <input id="log-filter" placeholder="필터 (예: Exception)" oninput="refreshLog()"
@@ -882,16 +998,28 @@
         }
 
         async function logcatStart() {
-            const { ok, data } = await postJson(`/api/logcat/${currentSerial}/start`, { clear: true, level: 'V' });
-            if (!ok) alert('수집 시작 실패: ' + (data.message || ''));
+            const toFile = !!(document.getElementById('log-to-file') || {}).checked;
+            const { ok, data } = await postJson(`/api/logcat/${currentSerial}/start`,
+                { clear: true, level: 'V', to_file: toFile });
+            if (!ok) { alert('수집 시작 실패: ' + (data.message || '')); return; }
+            if (data.file) alert(`파일로도 저장합니다:
+${data.file}`);
             refreshLog();
         }
         async function logcatStop() {
             await postJson(`/api/logcat/${currentSerial}/stop`, {});
             refreshLog();
         }
-        function logcatDownload() {
-            window.open(`/api/logcat/${currentSerial}/download`, '_blank');
+        async function logcatDownload() {
+            // Same reason as the thumbnails: window.open cannot send the token.
+            const res = await apiFetch(`/api/logcat/${currentSerial}/download`);
+            if (!res.ok) { alert('수집 중이 아닙니다.'); return; }
+            const url = URL.createObjectURL(await res.blob());
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `logcat_${currentSerial}.txt`;
+            a.click();
+            URL.revokeObjectURL(url);
         }
 
         async function refreshLog() {
@@ -901,7 +1029,7 @@
 
             const filter = (document.getElementById('log-filter') || {}).value || '';
             const qs = filter ? `?tail=300&contains=${encodeURIComponent(filter)}` : '?tail=300';
-            const res = await fetch(`/api/logcat/${currentSerial}${qs}`);
+            const res = await apiFetch(`/api/logcat/${currentSerial}${qs}`);
 
             if (!res.ok) {
                 summary.innerHTML = `<span style="color:#666;">수집 중이 아닙니다. [수집 시작]을 누르세요.</span>`;
@@ -913,7 +1041,8 @@
             const crashNote = d.crashes.length
                 ? `<span style="color:#ff6b6b; font-weight:700;">크래시 ${d.crashes.length}건</span>`
                 : `<span style="color:var(--success-color);">크래시 없음</span>`;
-            summary.innerHTML = `● 수집 중 · ${d.total}줄${filter ? ` (필터 일치 ${d.matched})` : ''} · ${crashNote}`;
+            const fileNote = d.file ? ` · <span style="color:#8ef;" title="${d.file}">파일 저장 중</span>` : '';
+            summary.innerHTML = `● 수집 중 · ${d.total}줄${filter ? ` (필터 일치 ${d.matched})` : ''} · ${crashNote}${fileNote}`;
 
             // Only the tail is rendered; the full buffer is what the download gives you.
             const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
@@ -975,7 +1104,7 @@
         }
 
         async function batchMacroPrompt() {
-            const res = await fetch('/api/macros');
+            const res = await apiFetch('/api/macros');
             const names = (await res.json()).macros || [];
             if (!names.length) { alert('저장된 매크로가 없습니다.'); return; }
             const name = prompt(`실행할 매크로 이름:\n\n${names.join('\n')}`, names[0]);
@@ -996,19 +1125,69 @@
             const fd = new FormData();
             fd.append('file', file);
             fd.append('serials', targets.join(','));
-            const res = await fetch('/api/batch/install', { method: 'POST', body: fd });
+            const res = await apiFetch('/api/batch/install', { method: 'POST', body: fd });
             reportBatch('일괄 APK 설치', await res.json().catch(() => null));
         }
 
         async function uninstall(pkg) { if (!confirm(pkg + ' 앱을 삭제하시겠습니까?')) return; await postJson(`/api/uninstall/${currentSerial}`, { package: pkg }); loadApps(); }
         async function playMacro(name) { if (!confirm(name + ' 매크로를 실행하시겠습니까?')) return; await postJson(`/api/macros/play/${currentSerial}`, { name: name }); }
-        async function toggleWireless() { await fetch(`/api/wireless/${currentSerial}`, { method: 'POST' }); alert('무선 연결 명령을 전송했습니다. 케이블 분리 전 로그를 확인하세요.'); }
+        async function toggleWireless() { await apiFetch(`/api/wireless/${currentSerial}`, { method: 'POST' }); alert('무선 연결 명령을 전송했습니다. 케이블 분리 전 로그를 확인하세요.'); }
         function dragOverHandler(ev) { ev.preventDefault(); ev.dataTransfer.dropEffect = "copy"; }
         function dropHandler(ev, serial) { ev.preventDefault(); if (ev.dataTransfer.items) { [...ev.dataTransfer.items].forEach((item) => { if (item.kind === 'file') { const file = item.getAsFile(); if (file.name.endsWith('.apk')) uploadApk(file, serial); } }); } }
-        async function uploadApk(file, serial) { alert(file.name + ' 설치를 시작합니다...'); const fd = new FormData(); fd.append('file', file); await fetch(`/api/install/${serial}`, { method: 'POST', body: fd }); alert('설치가 완료되었습니다.'); }
+        async function uploadApk(file, serial) { alert(file.name + ' 설치를 시작합니다...'); const fd = new FormData(); fd.append('file', file); await apiFetch(`/api/install/${serial}`, { method: 'POST', body: fd }); alert('설치가 완료되었습니다.'); }
+
+        // Farm health in the header. This replaces a hardcoded "시스템 정상 가동",
+        // which stayed green even with adb unreachable -- a status light that is
+        // always on is worse than none. Polled slower than the device grid
+        // because none of it changes second to second.
+        async function refreshFarmStatus() {
+            const box = document.getElementById('farm-status');
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+            if (!box) return;
+
+            let h;
+            try {
+                const res = await apiFetch('/api/health');
+                h = await res.json();
+            } catch (e) {
+                box.className = 'system-status down';
+                text.textContent = '서버에 연결할 수 없음';
+                box.title = '대시보드가 팜 서버에 닿지 못합니다.';
+                return;
+            }
+
+            if (h.status !== 'ok' || h.adb !== 'ok') {
+                box.className = 'system-status down';
+                text.textContent = 'adb 연결 불가';
+                box.title = h.message || 'adb 서버에 접속할 수 없습니다.';
+                return;
+            }
+
+            const notes = [];
+            if (h.devices_unusable) {
+                notes.push(`사용 불가 ${h.devices_unusable}대`);
+            }
+            const server = h.adb_server || {};
+            if (server.note) notes.push('adb 서버 버전 낮음');
+
+            box.className = 'system-status' + (notes.length ? ' warn' : '');
+            text.textContent = `기기 ${h.devices_total}대 · 유휴 ${h.devices_free}`
+                + (notes.length ? ' · ' + notes.join(' · ') : '');
+
+            const tips = [`adb: ${h.adb_path}`, `adb 서버 버전: ${server.version ?? '알 수 없음'}`];
+            if (server.note) tips.push(server.note);
+            if (h.devices_unusable) {
+                tips.push('사용 불가: ' + Object.entries(h.unusable || {})
+                    .map(([s, st]) => `${s} (${st})`).join(', '));
+            }
+            box.title = tips.join('\n');
+        }
 
         fetchDevices();
         setInterval(fetchDevices, 2000);
+        refreshFarmStatus();
+        setInterval(refreshFarmStatus, 5000);
     </script>
 </body>
 

@@ -64,6 +64,8 @@
         <div style="display:flex; align-items:center;">
             <span style="font-weight:bold; color:var(--accent); margin-right:10px;">STREAM</span>
             <span id="dev-serial" class="status"></span>
+            <span id="stream-target" class="status"
+                style="margin-left:8px; color:#666; font-size:0.75em; cursor:help;"></span>
         </div>
         <div>
             <button id="audio-btn" class="btn" onclick="toggleAudio()">🔊 AUDIO</button>
@@ -72,6 +74,21 @@
     <iframe id="stream-frame" src=""></iframe>
 
     <script>
+        // The dashboard stores the farm token in localStorage; these pages are
+        // opened from it and share the origin, so they reuse it. Same-origin
+        // only -- the token is never put in a URL that leaves this host.
+        function authHeaders(extra) {
+            const h = Object.assign({}, extra || {});
+            const t = localStorage.getItem('farmToken') || '';
+            if (t) h['X-Farm-Token'] = t;
+            return h;
+        }
+        function apiFetch(url, options) {
+            const opts = Object.assign({}, options || {});
+            opts.headers = authHeaders(opts.headers);
+            return fetch(url, opts);
+        }
+
         const params = new URLSearchParams(window.location.search);
         const serial = params.get('serial');
         const model = params.get('model') || 'Device';
@@ -86,9 +103,22 @@
         // in static/stream-config.js; without that file we stay on the LAN path.
         const TUNNEL = (window.STREAM_TUNNEL_HOST || '').trim();
 
-        function loadStream() {
+        // Fallback only. The real port comes from /api/config, which reads the
+        // same ws-scrcpy.config.json that the stream server itself reads.
+        const FALLBACK_STREAM_PORT = 8010;
+
+        async function streamPort() {
+            try {
+                const cfg = await (await apiFetch('/api/config')).json();
+                return cfg.stream_port || FALLBACK_STREAM_PORT;
+            } catch (e) {
+                return FALLBACK_STREAM_PORT;
+            }
+        }
+
+        async function loadStream() {
             let host = window.location.hostname;
-            let port = 8000;
+            let port = await streamPort();
             let wsProto = 'ws:';
             let httpProto = 'http:';
 
@@ -110,6 +140,16 @@
             const targetUrl = `${httpProto}//${host}:${port}/#!action=stream&udid=${serial}&player=mse&ws=${encodeURIComponent(wsUrl)}`;
 
             document.getElementById('stream-frame').src = targetUrl;
+
+            // Show which stream server this frame points at. When another
+            // program has taken the port, the frame renders that program's page
+            // and the failure looks like "mirroring is broken" -- seeing the
+            // address is what turns that into a one-line diagnosis.
+            const label = document.getElementById('stream-target');
+            if (label) {
+                label.textContent = `${host}:${port}`;
+                label.title = `스트림 서버 주소. 화면이 안 나오면 이 포트를 다른 프로그램이 쓰고 있는지 확인하세요 (ws-scrcpy.config.json 에서 변경).`;
+            }
         }
 
         // Initial Load
@@ -122,7 +162,7 @@
             if (!isAudioOn) {
                 // Start
                 try {
-                    const res = await fetch(`/api/audio/start/${serial}`, { method: 'POST' });
+                    const res = await apiFetch(`/api/audio/start/${serial}`, { method: 'POST' });
                     const data = await res.json();
                     if (data.status === 'success' || data.message.includes('already')) {
                         isAudioOn = true;
@@ -135,7 +175,7 @@
             } else {
                 // Stop
                 try {
-                    await fetch(`/api/audio/stop/${serial}`, { method: 'POST' });
+                    await apiFetch(`/api/audio/stop/${serial}`, { method: 'POST' });
                     isAudioOn = false;
                     btn.innerText = "🔊 AUDIO ON";
                     btn.classList.remove('active');
@@ -149,7 +189,7 @@
             // navigator.sendBeacon(`/api/audio/stop/${serial}`); // Beacon sends POST
             // But our API expects empty body, which beacon handles fine.
             // Fallback to fetch keepalive if supported or just sync xhr (deprecated)
-            fetch(`/api/audio/stop/${serial}`, { method: 'POST', keepalive: true });
+            apiFetch(`/api/audio/stop/${serial}`, { method: 'POST', keepalive: true });
         });
     </script>
 </body>

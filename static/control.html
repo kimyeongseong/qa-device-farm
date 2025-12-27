@@ -5,8 +5,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Device Controller</title>
-    <!-- Use CDN for MVP -->
-    <script type="text/javascript" src="https://unpkg.com/jmuxer/dist/jmuxer.min.js"></script>
+    <!-- Bundled locally: a device farm often sits on an isolated test network -->
+    <script type="text/javascript" src="/static/jmuxer.min.js"></script>
     <style>
         body {
             background-color: #121212;
@@ -69,6 +69,27 @@
     </div>
 
     <script>
+        // The dashboard stores the farm token in localStorage; this page is
+        // opened from it and shares the origin, so it reuses it.
+        function authHeaders(extra) {
+            const h = Object.assign({}, extra || {});
+            const t = localStorage.getItem('farmToken') || '';
+            if (t) h['X-Farm-Token'] = t;
+            return h;
+        }
+        function apiFetch(url, options) {
+            const opts = Object.assign({}, options || {});
+            opts.headers = authHeaders(opts.headers);
+            return fetch(url, opts);
+        }
+        // WebSockets cannot carry headers from a browser, so the token rides in
+        // the query string. Same origin only.
+        function wsUrlWithToken(path) {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const t = localStorage.getItem('farmToken') || '';
+            return `${proto}//${location.host}${path}` + (t ? `?token=${encodeURIComponent(t)}` : '');
+        }
+
         const urlParams = new URLSearchParams(window.location.search);
         const serial = urlParams.get('serial');
         const model = urlParams.get('model');
@@ -84,12 +105,8 @@
             debug: false
         });
 
-        // Dynamic Protocol Selection (WS vs WSS)
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const host = window.location.host;
-
         // Connect to Python Server Video WebSocket
-        const ws = new WebSocket(`${protocol}//${host}/ws/video/${serial}`);
+        const ws = new WebSocket(wsUrlWithToken(`/ws/video/${serial}`));
 
         ws.binaryType = 'arraybuffer';
 
@@ -106,7 +123,7 @@
         ws.onerror = (e) => console.error('WS Error:', e);
 
         // --- Control Logic ---
-        const controlWs = new WebSocket(`${protocol}//${host}/ws/control/${serial}`);
+        const controlWs = new WebSocket(wsUrlWithToken(`/ws/control/${serial}`));
 
         const videoElement = document.getElementById('player');
 
@@ -132,13 +149,13 @@
             const btn = document.getElementById('btn-record');
             if (!isRecording) {
                 if (!confirm("Start Recording?")) return;
-                await fetch(`/api/macros/start_record/${serial}`, { method: 'POST' });
+                await apiFetch(`/api/macros/start_record/${serial}`, { method: 'POST' });
                 isRecording = true;
                 btn.innerText = "⏹ Stop";
                 btn.style.background = "#ff0000";
             } else {
                 const name = prompt("Macro Name:") || `macro_${Date.now()}`;
-                const res = await fetch(`/api/macros/stop_record/${serial}`, {
+                const res = await apiFetch(`/api/macros/stop_record/${serial}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: name })
