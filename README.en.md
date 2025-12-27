@@ -324,10 +324,10 @@ python tests/run_all.py
 
 ```
 test_leases_and_input.py     ok       26 passed, 0 failed
-test_features.py             ok      167 passed, 0 failed
+test_features.py             ok      176 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
 test_cli.py                  ok       24 passed, 0 failed
-232 passed, 0 failed across 4 suites
+241 passed, 0 failed across 4 suites
 ```
 
 Each suite runs in its own process with a temporary directory as cwd, so one suite's monkeypatching and runtime state (`device_leases.json`, `macros/`) cannot leak into another, and the working tree stays clean.
@@ -350,6 +350,7 @@ What is covered: lease conflicts, TTL expiry and pool exhaustion; input injectio
 - **Device details are cached.** The dashboard polls every two seconds, and interrogating one device over adb measured 0.8–2.6s on real hardware — slower than the poll itself, and growing with every device added. Model, resolution and SDK cannot change while a device stays attached, so they are read once; battery (20s) and IP (60s) are cached briefly. Poll responses went from **0.8–2.6s to about 25ms**. `?refresh=1` forces a re-read.
 - **Leases are persisted.** `device_leases.json` survives a restart, which matters precisely when a restart happens: the CI job holding a device is still running, and only the farm would think that device is free. Leases that expired while the server was down are not restored.
 - **`/api/health` reports the adb server version.** A second adb at a different version on the machine keeps restarting the server, and every wireless device dies with it — invisible from the client path alone. Below version 41 the response carries an explanation.
+- **A missing adb binary means `degraded`.** adbutils reaches the adb server over TCP, so the device list, device details and thumbnails all work with no adb binary on the machine at all — while everything that shells out (input, app control, install, logcat, wireless, the screenrecord fallback) fails. Reporting only the path let the farm answer `ok` in exactly that state, so the resolved path is checked for existence and `adb_binary` carries what breaks.
 - **Screenshots are serialised per device.** Concurrent screenshot requests to one device make adb unstable, so an `asyncio.Lock` per device lets one through at a time.
 
 The reasoning and the boundaries are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (Korean).

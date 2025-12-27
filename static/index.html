@@ -1157,10 +1157,19 @@ ${data.file}`);
                 return;
             }
 
-            if (h.status !== 'ok' || h.adb !== 'ok') {
+            if (h.adb !== 'ok') {
                 box.className = 'system-status down';
                 text.textContent = 'adb 연결 불가';
                 box.title = h.message || 'adb 서버에 접속할 수 없습니다.';
+                return;
+            }
+
+            // adb 서버에는 닿는데 실행 파일이 없는 상태. 기기 목록과 썸네일은
+            // 그대로 나오므로, 명시하지 않으면 정상으로 보인다.
+            if (h.adb_binary && h.adb_binary.ok === false) {
+                box.className = 'system-status down';
+                text.textContent = `기기 ${h.devices_total}대 · adb 실행 파일 없음`;
+                box.title = h.adb_binary.note || `${h.adb_binary.path} 를 찾을 수 없습니다.`;
                 return;
             }
 

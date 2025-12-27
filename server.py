@@ -172,8 +172,29 @@ def get_adb_path():
     if on_path:
         return on_path
 
-    # Last resort: the default Windows install location.
+    # Last resort: the default Windows install location. It may well not exist --
+    # adb_binary_info() is what says so out loud.
     return "C:\\platform-tools\\adb.exe" if os.name == "nt" else "adb"
+
+def adb_binary_info():
+    """Whether the resolved adb binary is actually there.
+
+    adbutils reaches the adb *server* over TCP 5037, so the device list, device
+    details and screenshots all work with no adb binary on the machine at all.
+    Everything that shells out -- input, app control, install, logcat, wireless,
+    the screenrecord fallback -- fails with a bare "file not found". Reporting
+    only the path let the farm look healthy while half the API was dead.
+    """
+    path = get_adb_path()
+    found = shutil.which(path) or (os.path.exists(path) and path)
+    info = {"path": path, "ok": bool(found)}
+    if not found:
+        info["note"] = ("adb binary not found. Device list and screenshots still work "
+                        "(adbutils talks to the adb server directly), but input, app "
+                        "control, install, logcat, wireless and the screenrecord "
+                        "fallback all fail. Install Android platform-tools and put adb "
+                        "on PATH, or drop a copy in scrcpy_bin/.")
+    return info
 
 import subprocess
 from fastapi.responses import Response
@@ -1037,14 +1058,19 @@ async def health():
         # Attached-but-unusable devices are surfaced here too, so a monitor can
         # alert on "three phones went unauthorized" instead of "count dropped".
         unusable = {s: st for s, st in list_device_states().items() if s not in set(serials)}
+        binary = adb_binary_info()
         return {
-            "status": "ok",
+            # A reachable adb server is not the same thing as a working farm. If
+            # the binary is missing, say degraded rather than ok -- that is the
+            # whole point of a health endpoint.
+            "status": "ok" if binary["ok"] else "degraded",
             "adb": "ok",
             "devices_total": len(serials),
             "devices_free": len(serials) - leased,
             "devices_unusable": len(unusable),
             "unusable": unusable,
-            "adb_path": get_adb_path(),
+            "adb_path": binary["path"],
+            "adb_binary": binary,
             # The *server* version matters, not just which binary this process
             # would launch. A second adb of a different version on the machine
             # (bundled with a screen-mirroring tool, an IDE, a vendor utility)
@@ -1793,7 +1819,14 @@ if __name__ == "__main__":
     print(f"  Dashboard   http://localhost:{port}/")
     print(f"  API docs    http://localhost:{port}/docs")
     print(f"  Stream      port {stream_port} (ws-scrcpy, started separately)")
-    print(f"  adb         {get_adb_path()}")
+    adb_bin = adb_binary_info()
+    print(f"  adb         {adb_bin['path']}")
+    if not adb_bin["ok"]:
+        print("              NOT FOUND - input, app control, install, logcat and")
+        print("              wireless will fail. The device list and screenshots")
+        print("              still work because adbutils uses the adb server.")
+        print("              Install platform-tools on PATH, or copy adb into")
+        print("              scrcpy_bin/.")
     if FARM_TOKEN:
         print("  Access      token required (DEVICE_FARM_TOKEN is set)")
     else:

@@ -302,6 +302,22 @@ print()
 print("=== adb discovery ===")
 import shutil as _sh
 real_which = _sh.which
+real_exists = server.os.path.exists
+
+def bundled(answer):
+    """Answer for scrcpy_bin/ only; everything else keeps the real filesystem.
+
+    Whether the checkout running these tests happens to contain a bundled adb is
+    not this test's subject, and reading the real directory made the no-bundled
+    case pass or fail depending on the developer's working tree.
+    """
+    def exists(path):
+        if os.path.basename(os.path.dirname(path)) == "scrcpy_bin":
+            return answer
+        return real_exists(path)
+    return exists
+
+server.os.path.exists = bundled(False)
 server.shutil.which = lambda n: "/usr/local/bin/adb" if n == "adb" else None
 check("falls back to PATH when no bundled adb",
       server.get_adb_path() in ("/usr/local/bin/adb",), server.get_adb_path())
@@ -309,6 +325,15 @@ server.shutil.which = lambda n: None
 p = server.get_adb_path()
 check("last-resort path is platform-appropriate",
       p.endswith("adb.exe") if os.name == "nt" else p == "adb", p)
+
+# A bundled copy wins so a host can pin a known adb version.
+server.os.path.exists = bundled(True)
+server.shutil.which = lambda n: "/usr/local/bin/adb"
+check("bundled adb beats PATH",
+      os.path.basename(os.path.dirname(server.get_adb_path())) == "scrcpy_bin",
+      server.get_adb_path())
+
+server.os.path.exists = real_exists
 server.shutil.which = real_which
 
 print()
@@ -614,6 +639,32 @@ h = c.get("/api/health").json()
 check("unreachable adb server does not break health",
       h["adb_server"]["version"] is None and "note" in h["adb_server"], str(h["adb_server"]))
 server.adb.server_version = lambda: 41
+
+print()
+print("=== health notices when the adb binary is missing ===")
+# adbutils reaches the adb server over TCP, so the device list and screenshots
+# work with no adb binary on the machine at all -- while input, app control,
+# install, logcat and wireless every one fail with a bare "file not found".
+# Reporting only the path let the farm answer "ok" in exactly that state.
+real_get_adb_path = server.get_adb_path
+server.get_adb_path = lambda: os.path.join(WORK, "nowhere", "adb.exe")
+h = c.get("/api/health").json()
+check("missing binary is flagged", h["adb_binary"]["ok"] is False, str(h.get("adb_binary")))
+check("missing binary degrades status", h["status"] == "degraded", str(h["status"]))
+check("missing binary is still adb-server-reachable", h["adb"] == "ok", str(h["adb"]))
+check("missing binary explains the blast radius",
+      "input" in h["adb_binary"].get("note", ""), str(h["adb_binary"]))
+check("missing binary still reports the path it tried",
+      h["adb_path"] == h["adb_binary"]["path"], str(h["adb_binary"]))
+
+present = os.path.join(WORK, "adb.exe")
+open(present, "wb").close()
+server.get_adb_path = lambda: present
+h = c.get("/api/health").json()
+check("present binary is ok", h["adb_binary"]["ok"] is True, str(h["adb_binary"]))
+check("present binary keeps status ok", h["status"] == "ok", str(h["status"]))
+check("present binary carries no note", "note" not in h["adb_binary"], str(h["adb_binary"]))
+server.get_adb_path = real_get_adb_path
 
 print()
 print("=== wirelessly attached devices stay in the list ===")

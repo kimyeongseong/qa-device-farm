@@ -336,10 +336,10 @@ python tests/run_all.py
 
 ```
 test_leases_and_input.py     ok       26 passed, 0 failed
-test_features.py             ok      167 passed, 0 failed
+test_features.py             ok      176 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
 test_cli.py                  ok       24 passed, 0 failed
-232 passed, 0 failed across 4 suites
+241 passed, 0 failed across 4 suites
 ```
 
 각 스위트는 별도 프로세스에서 임시 디렉터리를 cwd로 잡고 돌기 때문에, 서로의 monkeypatch나
@@ -368,6 +368,7 @@ CLI 전 서브커맨드.
 - **기기 정보는 캐시합니다.** 대시보드가 2초마다 폴링하는데, 기기 하나를 adb로 캐묻는 데 실측 0.8~2.6초가 걸립니다. 폴링 주기보다 느린 데다 기기 수에 비례해 늘어나서, 팜이 커질수록 먼저 무너지는 지점입니다. 모델·해상도·SDK는 연결 중 바뀌지 않으니 한 번만 읽고, 배터리(20초)·IP(60초)만 짧게 캐시합니다. 폴링 응답이 **0.8~2.6초 → 약 25ms**가 됐습니다. 최신값이 필요하면 `?refresh=1`.
 - **점유는 파일로 남습니다.** `device_leases.json`에 기록해서 서버를 재시작해도 유지됩니다. 재시작은 하필 가장 곤란한 순간에 일어납니다 — 기기를 잡고 있는 CI 잡은 계속 돌고 있는데, 팜만 그 기기를 유휴로 착각하는 상황이니까요. 서버가 죽어 있는 동안 만료된 lease는 복원하지 않습니다.
 - **`/api/health`가 adb 서버 버전을 보고합니다.** 클라이언트 경로만으로는 드러나지 않는 문제가 있습니다 — 머신에 다른 버전의 adb가 있으면 서로 서버를 죽이고, 그때마다 무선 연결이 전부 끊깁니다. 41 미만이면 경고 문구가 함께 나옵니다.
+- **adb 실행 파일이 없으면 `degraded`입니다.** adbutils는 adb 서버에 TCP로 붙기 때문에, 머신에 adb 바이너리가 하나도 없어도 기기 목록·상세정보·썸네일은 정상으로 나옵니다. 반면 프로세스를 띄우는 기능(입력·앱 제어·설치·logcat·무선·간이 미러링)은 전부 실패합니다. 경로만 보고하면 이 상태에서 팜이 `ok`라고 답합니다. 그래서 해석된 경로가 실제로 존재하는지 확인하고, 없으면 무엇이 죽는지까지 `adb_binary`에 담아 돌려줍니다.
 - **기기당 스크린샷 직렬화.** 같은 기기에 스크린샷 요청이 겹치면 adb가 불안정해져서, 기기별 `asyncio.Lock`으로 한 번에 하나만 통과시킵니다.
 
 설계 배경과 한계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)에 정리했습니다.

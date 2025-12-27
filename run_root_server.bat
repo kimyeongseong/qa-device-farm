@@ -24,7 +24,7 @@ if not exist "%WS_SCRCPY_CONFIG%" (
 start "Backend Server (8001)" cmd /k "python server.py"
 
 :: Start Frontend (Node.js / ws-scrcpy)
-start "Stream Server" cmd /k "cd /d "%~dp0ws-scrcpy" && npm start"
+start "Stream Server" /d "%~dp0ws-scrcpy" cmd /k npm start
 
 echo Servers are starting...
 echo ===================================================

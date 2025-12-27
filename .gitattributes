@@ -1,0 +1,9 @@
+# cmd.exe reads .bat byte by byte and drops characters when the line endings
+# are LF, so the file has to stay CRLF no matter what the cloning machine's
+# core.autocrlf is set to. Getting this wrong makes run_root_server.bat fail
+# with garbled errors like "'rting' is not recognized".
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Everything else: normalise to LF in the repository.
+* text=auto
