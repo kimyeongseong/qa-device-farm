@@ -364,9 +364,3 @@ The reasoning and the boundaries are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
 - **Macros are still coordinate-based.** Resolution differences are corrected by proportional scaling, but devices with a different aspect ratio or a re-flowed layout (foldables, tablets) will not match. It does not find UI elements. Macros recorded before this feature have no resolution and replay unscaled.
 - **The in-memory log buffer is 20k lines per device** and is lost on restart. For long runs enable `to_file` when starting the capture; the full log lands in `logs/`.
 - **PiP is Chromium-only.** Firefox has no such API, so the button does not appear at all. Browser policy requires a real user click to enter it.
-
----
-
-## Credits
-
-The lease model and the session-less control API follow [Toss's device farm (Nebula) article](https://toss.tech/article/device-farm-nebula), scaled down to what this project needs. Nebula's distributed locking, agent layer, iOS mirroring and custom driver are out of scope here.

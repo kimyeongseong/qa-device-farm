@@ -31,8 +31,6 @@ QA를 하면서 실기기가 개인 PC에 물려 있는 구조가 계속 걸렸�
 
 그래서 조작 하나 = HTTP 요청 하나로 갔습니다. 서버는 요청 사이에 기기 세션을 붙들지 않습니다. 상태가 정말 필요한 것은 둘뿐입니다 — "지금 누가 이 기기를 쓰는가"(lease)와, 폴링을 감당하기 위한 기기 정보 캐시. 둘 다 아래에서 따로 다룹니다.
 
-토스 Nebula 아티클에서 같은 판단(Appium 세션 제거, stateless HTTP)을 훨씬 큰 규모에서 내린 걸 보고, 이 방향이 맞다고 확인했습니다.
-
 ## 점유(Lease)
 
 ```
@@ -147,6 +145,5 @@ APK 업로드도 같은 문제가 있었습니다. 파일 이름이 셸 문자�
 
 ## 참고
 
-- [토스 — 디바이스 팜 Nebula](https://toss.tech/article/device-farm-nebula)
 - [ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy)
 - [scrcpy](https://github.com/Genymobile/scrcpy)
