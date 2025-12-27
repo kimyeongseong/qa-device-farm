@@ -194,9 +194,25 @@ check("reading a non-capturing device -> 404", r.status_code == 404, r.text)
 r = c.post("/api/logcat/DEV_A/stop")
 check("stop reports counts", r.json().get("lines") == 4 and r.json().get("crashes") == 2, r.text)
 check("stop terminated the process", proc.killed)
-check("session removed", "DEV_A" not in server.logcat_sessions)
+
+# Stop, then collect, is the obvious order -- and popping the session on stop
+# made the buffer and the download 404 the instant you stopped, so a run without
+# to_file threw away everything it had just captured.
+r = c.get("/api/logcat/DEV_A")
+check("buffer survives stop", r.status_code == 200 and len(r.json()["lines"]) == 4, r.text)
+check("stopped session reports capturing false", r.json()["capturing"] is False, r.text)
+check("crashes survive stop", len(r.json()["crashes"]) == 2, r.text)
+r = c.get("/api/logcat/DEV_A/download")
+check("download survives stop", r.status_code == 200 and r.text.count("\n") == 4,
+      f"{r.status_code} {r.text[:80]}")
+r = c.get("/api/logcat")
+check("status marks it not capturing",
+      c.get("/api/logcat").json()["sessions"]["DEV_A"]["capturing"] is False, r.text)
+
 r = c.post("/api/logcat/DEV_A/stop")
 check("stopping twice is harmless", r.status_code == 200, r.text)
+check("stopping twice says not capturing",
+      r.json().get("message") == "Not capturing", r.text)
 
 r = c.post("/api/logcat/DEV_A/start", json={"level": "Z"})
 check("invalid level -> 400", r.status_code == 400, r.text)
@@ -705,6 +721,56 @@ for serial, wlan, expect_ip, label in [
     if found:
         check(f"{label}: ip={expect_ip}", found[0]["ip"] == expect_ip, str(found[0]["ip"]))
         check(f"{label}: 해상도 읽힘", found[0]["width"] == 1600 or serial.startswith("R3"), str(found[0]))
+
+print()
+print("=== one phone on two adb transports is one device ===")
+# Android 11+ wireless debugging advertises the device over mDNS, so adb lists
+# the same phone twice. Measured on a real tablet: ci-A claimed HA2F2NVC, then
+# ci-B asked for "any free device" and was handed adb-HA2F2NVC-...._tcp -- two
+# jobs driving one screen, which is the one thing leases exist to prevent.
+USB = "HA2F2NVC"
+MDNS = "adb-HA2F2NVC-xYKOdg._adb-tls-connect._tcp"
+server.device_leases.clear()
+server.device_cache.clear()
+server.adb.list = lambda: [Info(USB, "device"), Info(MDNS, "device")]
+server.adb.device_list = lambda: [WirelessDev(USB, "192.168.0.170"),
+                                  WirelessDev(MDNS, "192.168.0.170")]
+
+body = c.get("/api/devices").json()["devices"]
+check("두 transport가 카드 하나로", len(body) == 1, str([d["serial"] for d in body]))
+check("USB 시리얼 쪽이 남음", body and body[0]["serial"] == USB, str(body))
+h = c.get("/api/health").json()
+check("기기 수도 1대", h["devices_total"] == 1, str(h))
+
+r = c.post(f"/api/device/{USB}/occupy", json={"owner": "ci-A", "ttl_seconds": 60})
+check("USB 시리얼로 점유 성공", r.json()["status"] == "success", r.text)
+r = c.post("/api/devices/occupy", json={"owner": "ci-B", "ttl_seconds": 60})
+check("mDNS 쌍둥이를 유휴로 내주지 않음", r.status_code == 409, r.text)
+
+# And the alias must not be a way around the lease when named outright.
+r = c.post(f"/api/device/{MDNS}/occupy", json={"owner": "ci-B", "ttl_seconds": 60})
+check("mDNS 이름으로도 우회 불가", r.status_code == 409, r.text)
+check("409가 실제 점유자를 알려줌", r.json().get("owner") == "ci-A", r.text)
+r = c.post(f"/api/device/{MDNS}/input",
+           json={"type": "tap", "x": 1, "y": 2, "owner": "ci-B"})
+check("mDNS 이름으로 입력도 막힘", r.status_code == 409, r.text)
+
+# Claiming by either name locks both, and releasing by either frees both.
+check("점유 항목이 하나로 기록됨", len(c.get("/api/leases").json()["leases"]) == 1,
+      c.get("/api/leases").text)
+r = c.post(f"/api/device/{MDNS}/release", json={"owner": "ci-A"})
+check("mDNS 이름으로 반납 가능", r.json()["status"] == "success", r.text)
+check("반납 후 비어 있음", c.get("/api/leases").json()["leases"] == {},
+      c.get("/api/leases").text)
+
+# Cable out: the mDNS name is now the only way in, so it must survive.
+server.device_cache.clear()
+server.adb.list = lambda: [Info(MDNS, "device")]
+server.adb.device_list = lambda: [WirelessDev(MDNS, "192.168.0.170")]
+body = c.get("/api/devices").json()["devices"]
+check("USB가 빠지면 mDNS 기기가 남음",
+      len(body) == 1 and body[0]["serial"] == MDNS, str(body))
+server.device_leases.clear()
 
 print()
 print("=== a device whose details fail is shown, not dropped ===")

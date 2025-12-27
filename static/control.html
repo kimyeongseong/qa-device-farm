@@ -105,6 +105,38 @@
             debug: false
         });
 
+        // `screenrecord` only emits frames when the screen changes, and a device
+        // sitting idle is the normal state while you watch a test wait. The buffer
+        // then runs dry, the element pauses, and it does *not* resume by itself
+        // when frames come back -- so the mirror stayed frozen until a reload,
+        // even though data was arriving. Measured on a TB373FU: ready=4 with a
+        // growing buffer and paused=true at the same time.
+        // Polled rather than event-driven on purpose: once the element pauses with
+        // readyState already at HAVE_ENOUGH_DATA, no further 'canplay' fires, so a
+        // listener never gets the chance to restart it. Verified on a TB373FU --
+        // six seconds after a pause the only event seen was 'pause' itself.
+        const player = document.getElementById('player');
+        setInterval(() => {
+            const buffered = player.buffered;
+            if (!buffered.length) {
+                return;
+            }
+            // Snap to the newest frame whenever the playhead leaves the buffered
+            // range -- in *either* direction. Behind means the screen was idle and
+            // a backlog built up; ahead happens because jmuxer advances the timeline
+            // at the configured 60fps while `screenrecord` delivers far fewer frames
+            // than that, so the playhead outruns the data and the element will not
+            // resume at all. Measured on a TB373FU: currentTime 35.49 against a
+            // buffered end of 23.31, permanently stuck.
+            const live = buffered.end(buffered.length - 1);
+            if (player.currentTime > live || live - player.currentTime > 1) {
+                player.currentTime = Math.max(0, live - 0.1);
+            }
+            if (player.paused) {
+                player.play().catch(() => { /* autoplay blocked; the user can hit play */ });
+            }
+        }, 1000);
+
         // Connect to Python Server Video WebSocket
         const ws = new WebSocket(wsUrlWithToken(`/ws/video/${serial}`));
 

@@ -336,10 +336,10 @@ python tests/run_all.py
 
 ```
 test_leases_and_input.py     ok       26 passed, 0 failed
-test_features.py             ok      176 passed, 0 failed
+test_features.py             ok      193 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
 test_cli.py                  ok       24 passed, 0 failed
-241 passed, 0 failed across 4 suites
+258 passed, 0 failed across 4 suites
 ```
 
 각 스위트는 별도 프로세스에서 임시 디렉터리를 cwd로 잡고 돌기 때문에, 서로의 monkeypatch나

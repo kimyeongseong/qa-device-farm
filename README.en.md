@@ -324,10 +324,10 @@ python tests/run_all.py
 
 ```
 test_leases_and_input.py     ok       26 passed, 0 failed
-test_features.py             ok      176 passed, 0 failed
+test_features.py             ok      193 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
 test_cli.py                  ok       24 passed, 0 failed
-241 passed, 0 failed across 4 suites
+258 passed, 0 failed across 4 suites
 ```
 
 Each suite runs in its own process with a temporary directory as cwd, so one suite's monkeypatching and runtime state (`device_leases.json`, `macros/`) cannot leak into another, and the working tree stays clean.

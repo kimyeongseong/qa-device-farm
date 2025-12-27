@@ -219,6 +219,41 @@ LEASE_FILE = "device_leases.json"
 
 device_leases = {}  # { serial: {"owner": str, "expires_at": float} }
 
+# Android 11+ wireless debugging advertises the device over mDNS, so adb lists
+# one phone twice: by its serial, and as
+# "adb-<serial>-<suffix>._adb-tls-connect._tcp". Both transports work and both
+# report the same ro.serialno and boot_id.
+#
+# Counting them as two devices broke the only guarantee this farm makes.
+# Measured on a real tablet: ci-A claimed HA2F2NVC, then ci-B asked for "any
+# free device" and was handed adb-HA2F2NVC-...._tcp -- two jobs driving one
+# screen, which is what leases exist to prevent. Batch runs hit it twice and the
+# device count was inflated too.
+MDNS_ALIAS = re.compile(r"^adb-(?P<serial>.+)-[^-]+\._adb-tls-connect\._tcp$")
+
+def mdns_base(serial: str):
+    """The plain serial behind an mDNS transport name, or None."""
+    m = MDNS_ALIAS.match(serial)
+    return m.group("serial") if m else None
+
+def lease_key(serial: str) -> str:
+    """Leases belong to a physical device, not to an adb transport name.
+
+    Commands still go out on whichever transport the caller named -- only the
+    bookkeeping is collapsed, so claiming a device by either name locks both.
+    """
+    return mdns_base(serial) or serial
+
+def drop_duplicate_transports(serials):
+    """Hide an mDNS alias when its plain serial is present in the same listing.
+
+    Kept when it is the only way to reach the device, which is the whole point
+    of wireless debugging once the cable is out.
+    """
+    # mdns_base() is None for a plain serial, and None is never in `direct`.
+    direct = {s for s in serials if not mdns_base(s)}
+    return [s for s in serials if mdns_base(s) not in direct]
+
 def save_leases():
     """Persist leases so a server restart does not silently free every device.
 
@@ -257,9 +292,10 @@ load_leases()
 
 def get_lease(serial: str):
     """Return the live lease for a device, dropping it if it has expired."""
-    lease = device_leases.get(serial)
+    key = lease_key(serial)
+    lease = device_leases.get(key)
     if lease and lease["expires_at"] <= time.time():
-        del device_leases[serial]
+        del device_leases[key]
         save_leases()
         return None
     return lease
@@ -503,10 +539,12 @@ STATE_LABELS = {
 def list_device_states():
     """Every serial adb knows about, mapped to its state."""
     try:
-        return {info.serial: info.state for info in adb.list()}
+        states = {info.serial: info.state for info in adb.list()}
     except Exception as e:
         print(f"adb.list() failed: {e}")
         return {}
+    keep = set(drop_duplicate_transports(list(states)))
+    return {s: st for s, st in states.items() if s in keep}
 
 # --- Device detail cache ---
 # The dashboard polls /api/devices every two seconds, and interrogating one
@@ -615,7 +653,9 @@ async def get_devices(refresh: bool = False):
     try:
         devices = []
         states = list_device_states()
-        adbd = adb.device_list()
+        attached = adb.device_list()
+        keep = set(drop_duplicate_transports([d.serial for d in attached]))
+        adbd = [d for d in attached if d.serial in keep]
         online = {d.serial for d in adbd}
         forget_absent_devices(set(states) | online)
 
@@ -946,7 +986,7 @@ class ReleaseRequest(BaseModel):
 
 def grant_lease(serial: str, req: OccupyRequest):
     lease = {"owner": req.owner, "expires_at": time.time() + max(1, req.ttl_seconds)}
-    device_leases[serial] = lease
+    device_leases[lease_key(serial)] = lease
     save_leases()
     return {"status": "success", "serial": serial, **lease}
 
@@ -962,7 +1002,7 @@ async def occupy_device(serial: str, req: OccupyRequest):
 async def occupy_any_device(req: OccupyRequest):
     """Claim any free device. This is what a CI job calls when it just needs 'an Android'."""
     try:
-        serials = [d.serial for d in adb.device_list()]
+        serials = drop_duplicate_transports([d.serial for d in adb.device_list()])
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
@@ -980,7 +1020,7 @@ async def release_device(serial: str, req: ReleaseRequest):
     conflict = lease_conflict(serial, req.owner)
     if conflict:
         return conflict
-    device_leases.pop(serial, None)
+    device_leases.pop(lease_key(serial), None)
     save_leases()
     return {"status": "success", "serial": serial}
 
@@ -1053,7 +1093,7 @@ def adb_server_info():
 async def health():
     """Liveness probe: is the server up, and can it still talk to adb?"""
     try:
-        serials = [d.serial for d in adb.device_list()]
+        serials = drop_duplicate_transports([d.serial for d in adb.device_list()])
         leased = sum(1 for s in serials if get_lease(s))
         # Attached-but-unusable devices are surfaced here too, so a monitor can
         # alert on "three phones went unauthorized" instead of "count dropped".
@@ -1497,11 +1537,21 @@ async def start_logcat(serial: str, req: LogcatStartRequest = LogcatStartRequest
 
 @app.post("/api/logcat/{serial}/stop")
 async def stop_logcat(serial: str):
-    session = logcat_sessions.pop(serial, None)
-    if not session:
+    # Kept in the table rather than popped: stopping a capture and *then*
+    # collecting the log is the obvious order, and dropping the session here made
+    # both the buffer and the download 404 the moment you stopped -- so a run
+    # without to_file lost everything it had just captured. The next /start
+    # reaps the ended session and begins clean.
+    # "stopped" is not "ended": a pump whose adb already died is ended but still
+    # holds a process and pipes, and that is precisely the case that needs
+    # reaping. Only an already-reaped session is a no-op.
+    session = logcat_sessions.get(serial)
+    if not session or session.get("stopped"):
         return {"status": "success", "message": "Not capturing"}
 
     await reap_logcat(serial, session)
+    session["ended"] = True
+    session["stopped"] = True
     print(f"[{serial}] Logcat capture stopped ({len(session['lines'])} lines)")
     return {"status": "success", "lines": len(session["lines"]),
             "crashes": len(session["crashes"])}
