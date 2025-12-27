@@ -17,6 +17,13 @@
 
 ### 수정 (Fixed)
 
+- **ws-scrcpy도 기기 하나를 두 개로 보고 서로 포트를 다투던 문제** — 팜 API에서 고친 중복
+  transport 문제를 ws-scrcpy는 자체 기기 목록으로 독립적으로 겪고 있었습니다. 양쪽 transport에
+  scrcpy 서버를 띄우려 해서 한쪽이 기기 포트 8886에서
+  `java.net.BindException: Address already in use`로 죽습니다. 어느 쪽이 이기는지가 실행마다
+  달라지므로, 영상은 살아 있는 세션에서 오는데 조작은 이미 죽은 세션으로 가는 상태가 됩니다
+  (증상: **미러링은 되는데 터치가 안 됨**). `ControlCenter`에서 mDNS 별칭을 접어
+  기기 목록이 물리 기기당 하나가 됩니다 — 케이블을 뽑아 별칭이 유일한 경로가 되면 유지합니다.
 - **미러링이 `spawn adb ENOENT`로 죽던 문제** — `server.py`는 `scrcpy_bin/` → PATH 순으로
   경로를 직접 해석하지만 **ws-scrcpy는 `adb`를 PATH에서 찾아 프로세스로 띄웁니다.** 그래서
   adb가 `scrcpy_bin/`에만 있으면 대시보드·입력·설치는 전부 정상이고 `/api/health`도

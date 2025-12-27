@@ -16,6 +16,23 @@ export class ControlCenter extends BaseControlCenter<GoogDeviceDescriptor> imple
     private static readonly defaultWaitAfterError = 1000;
     private static instance?: ControlCenter;
 
+    /**
+     * Android 11+ wireless debugging advertises the device over mDNS, so adb
+     * reports the same phone twice: once by serial, once as
+     * "adb-<serial>-<suffix>._adb-tls-connect._tcp". Both are usable transports to
+     * one device -- and starting a scrcpy server over each makes the second die
+     * with "java.net.BindException: Address already in use" on device port 8886.
+     * Which transport wins varies per run, so the picture would come from one
+     * session while control went to the one that had already exited, which reads
+     * as "mirroring works but touch does nothing".
+     */
+    private static readonly MDNS_ALIAS = /^adb-(.+)-[^-]+\._adb-tls-connect\._tcp$/;
+
+    private static mdnsBase(udid: string): string | undefined {
+        const match = udid.match(ControlCenter.MDNS_ALIAS);
+        return match ? match[1] : undefined;
+    }
+
     private initialized = false;
     private client: AdbKitClient = AdbExtended.createClient();
     private tracker?: Tracker;
@@ -83,6 +100,16 @@ export class ControlCenter extends BaseControlCenter<GoogDeviceDescriptor> imple
     };
 
     private handleConnected(udid: string, state: string): void {
+        // Keep one entry per physical device. The mDNS name is only worth having
+        // when it is the sole way in, i.e. the cable is out.
+        const base = ControlCenter.mdnsBase(udid);
+        if (base && this.deviceMap.has(base)) {
+            return;
+        }
+        if (!base) {
+            this.dropAliasesOf(udid);
+        }
+
         let device = this.deviceMap.get(udid);
         if (device) {
             device.setState(state);
@@ -90,6 +117,26 @@ export class ControlCenter extends BaseControlCenter<GoogDeviceDescriptor> imple
             device = new Device(udid, state);
             device.on('update', this.onDeviceUpdate);
             this.deviceMap.set(udid, device);
+        }
+    }
+
+    /**
+     * Drop any mDNS alias of a serial that has just shown up directly. adb hands
+     * them over in no fixed order, so the alias is often already tracked by the
+     * time the plain serial arrives.
+     */
+    private dropAliasesOf(serial: string): void {
+        for (const udid of Array.from(this.deviceMap.keys())) {
+            if (ControlCenter.mdnsBase(udid) !== serial) {
+                continue;
+            }
+            const alias = this.deviceMap.get(udid);
+            if (alias) {
+                alias.off('update', this.onDeviceUpdate);
+                alias.setState(DeviceState.DISCONNECTED);
+            }
+            this.deviceMap.delete(udid);
+            this.descriptors.delete(udid);
         }
     }
 

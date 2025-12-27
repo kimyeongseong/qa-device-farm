@@ -18,6 +18,12 @@ to their files, not the MIT license in `LICENSE`.
 | `index.ts` | Forces the stream defaults this farm runs on (720p bound, 7 Mbps, 60 fps, 10-frame I-frame interval, fit-to-screen) instead of the upstream prompt, and instantiates `PipController`. |
 | `PipController.ts` | New file. A floating Picture-in-Picture button, so a device stays visible while the operator works in another window and several devices can be watched at once. Hands the MSE `<video>` straight to PiP; for the canvas decoders (Broadway, TinyH264, WebCodecs, MJPEG) it bridges `canvas.captureStream()` through a hidden video, since PiP only accepts video elements. |
 
+**Correctness** — under `ws-scrcpy/src/server/`:
+
+| File | Change |
+|---|---|
+| `goog-device/services/ControlCenter.ts` | Collapses the two adb transports of one device onto a single entry. Android 11+ wireless debugging advertises over mDNS, so adb reports the same phone as both `HA2F2NVC` and `adb-HA2F2NVC-<suffix>._adb-tls-connect._tcp`; upstream tracked each separately and started a scrcpy server over both, and the second died with `java.net.BindException: Address already in use` on device port 8886. Which transport won varied per run, so the picture could arrive from one session while control went to the one that had already exited. The mDNS name is kept only when the plain serial is absent — with the cable out it is the only way in. |
+
 **Build repair** — upstream at this commit cannot be installed or built on a
 current Node. Every change below exists to fix that, and each one is scoped to
 code this farm does not ship:
