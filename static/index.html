@@ -711,15 +711,20 @@
                     // Unusable devices get no screenshot, no batch checkbox and
                     // no controls -- only the reason they cannot be used.
                     const usable = isUsable(dev);
+                    // iOS는 팜에서 기기 한 대로 보이지만 adb가 없습니다. 그래서
+                    // APK 설치·배치·간이 미러링처럼 adb가 필요한 버튼은 아예
+                    // 달지 않고, 원격/AI 두 가지만 남깁니다.
+                    const isIos = dev.platform === 'ios';
                     const thumb = usable
-                        ? `<img class="device-thumb" alt="" onclick="openControl('${dev.serial}', '${dev.model}')">`
+                        ? `<img class="device-thumb" alt="" onclick="openControl('${dev.serial}', '${dev.model}', '${dev.platform || 'android'}')">`
                         : `<div class="device-thumb" style="display:flex; align-items:center; justify-content:center; background:#151515; color:#ff9f43; font-size:2.4em;">⚠</div>`;
                     card.innerHTML = `
                          <div style="position:relative;">
                              <div style="position:absolute; top:5px; left:5px; background:rgba(0,0,0,0.7); color:#0f0; padding:2px 6px; font-size:0.8em; border-radius:4px; border:1px solid #0f0; z-index:10;">No.${index + 1}</div>
-                             ${usable ? `<input type="checkbox" class="batch-check" title="일괄 작업 대상으로 선택"
+                             ${usable && !isIos ? `<input type="checkbox" class="batch-check" title="일괄 작업 대상으로 선택"
                                     ${batchSelected.has(dev.serial) ? 'checked' : ''}
                                     onchange="toggleBatch('${dev.serial}', this.checked)">` : ''}
+                             ${isIos ? `<div style="position:absolute; top:5px; right:5px; background:rgba(0,0,0,0.75); color:#8ef; padding:2px 6px; font-size:0.75em; border-radius:4px; border:1px solid #356; z-index:10;">iOS</div>` : ''}
                              ${thumb}
                         </div>
                         <div class="card-header">
@@ -730,8 +735,16 @@
                             <span class="battery-info" style="color:${(dev.battery === '100%') ? 'var(--success-color)' : '#aaa'}">${dev.battery}</span>
                         </div>
                         <div class="lease-info" style="margin-bottom:15px; font-size:0.8em; font-family:'JetBrains Mono';">${leaseBadge(dev)}</div>
-                        ${usable
-                            ? `<button class="btn btn-manage" onclick="openManage('${dev.serial}', '${dev.model}')">⚙️ 시스템 관리 (앱)</button>
+                        ${!usable
+                            ? `<button class="btn btn-manage" disabled style="opacity:0.4; cursor:not-allowed;">사용 불가</button>`
+                            : isIos
+                            ? `<button class="btn btn-manage" onclick="openControl('${dev.serial}', '${dev.model}', 'ios')">📱 원격 조작</button>
+                               <div style="display:flex; gap:6px; margin-top:6px;">
+                                 <button class="btn btn-delete" style="flex:1; color:#bb86fc; border-color:#553;"
+                                   title="AI 에이전트가 이 기기를 조작하는 방법"
+                                   onclick="showAgentHelp('${dev.serial}', 'ios')">🤖 AI 조작</button>
+                               </div>`
+                            : `<button class="btn btn-manage" onclick="openManage('${dev.serial}', '${dev.model}')">⚙️ 시스템 관리 (앱)</button>
                                <div style="display:flex; gap:6px; margin-top:6px;">
                                  <button class="btn btn-delete" style="flex:1; color:#8ef; border-color:#356;"
                                    title="ws-scrcpy 없이 Python 서버만으로 보는 저지연 대체 화면"
@@ -739,8 +752,12 @@
                                  <button class="btn btn-delete" style="flex:1; color:#fc8; border-color:#653;"
                                    title="미러가 검은 화면일 때: 기기에 남은 스트림 프로세스를 정리합니다"
                                    onclick="resetStream('${dev.serial}')">스트림 정리</button>
-                               </div>`
-                            : `<button class="btn btn-manage" disabled style="opacity:0.4; cursor:not-allowed;">사용 불가</button>`}
+                               </div>
+                               <div style="display:flex; gap:6px; margin-top:6px;">
+                                 <button class="btn btn-delete" style="flex:1; color:#bb86fc; border-color:#553;"
+                                   title="AI 에이전트가 이 기기를 조작하는 방법"
+                                   onclick="showAgentHelp('${dev.serial}', 'android')">🤖 AI 조작</button>
+                               </div>`}
                     `;
                     container.appendChild(card);
                     if (usable) refreshThumb(card.querySelector('.device-thumb'), dev.serial);
@@ -749,10 +766,39 @@
         }
 
         function copySerial(txt) { navigator.clipboard.writeText(txt); alert('시리얼 번호가 복사되었습니다: ' + txt); }
-        function openControl(serial, model = 'Device') {
+        function openControl(serial, model = 'Device', platform = 'android') {
+            // 아이폰은 ws-scrcpy가 아니라 스크린샷 폴링으로 봅니다.
+            if (platform === 'ios') {
+                window.open(`/static/ios.html`, '_blank',
+                            'width=520,height=980,location=no,status=no,resizable=yes');
+                return;
+            }
             // Open the Custom Wrapper Page (Stream + Audio)
             const url = `/static/stream.html?serial=${serial}&model=${encodeURIComponent(model)}`;
             window.open(url, '_blank', 'width=500,height=850,location=no,status=no,resizable=yes');
+        }
+
+        // AI 조작은 브라우저가 아니라 에이전트가 하는 일이라, 대시보드는 "어떻게
+        // 시키는지"만 알려줍니다. 콘솔을 여기 만들어봐야 에이전트는 그걸 못 씁니다.
+        function showAgentHelp(serial, platform) {
+            const owner = `ai-${(navigator.userAgent.includes('Mac') ? 'mac' : 'pc')}`;
+            const openLine = platform === 'ios'
+                ? 'open_app Notes' : 'open_app com.android.settings';
+            const script = [
+                `# 1) 에이전트용 스킬 등록 (한 번만)`,
+                `python cli.py skill --target claude   # 또는 --target codex`,
+                ``,
+                `# 2) 이 기기를 잡고 조작하기`,
+                `python cli.py harness --serial ${serial} --owner ${owner} --occupy --release <<'EOF'`,
+                openLine,
+                `wait_stable`,
+                `elements`,
+                `EOF`,
+            ].join('\n');
+            navigator.clipboard.writeText(script).catch(() => { });
+            alert(`AI 조작 방법 (클립보드에 복사했습니다)\n\n${script}\n\n` +
+                  `사용 가능한 동사: open_app / tap_text / type_text / tap / swipe / key / ` +
+                  `wait_stable / screenshot / elements / sleep`);
         }
 
         // Mirroring without ws-scrcpy: server.py streams `adb screenrecord`

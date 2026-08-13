@@ -43,6 +43,8 @@ Browser (dashboard)          CLI / CI pipeline
 | **Audio forwarding** | Device audio to the PC through the scrcpy binary. |
 | **Picture-in-Picture** | Float the mirror in an always-on-top window: keep watching a device while working elsewhere, or several at once. |
 | **CLI / CI** | No sessions — claim, drive, read logs and release over plain HTTP. |
+| **AI agent control** | Drive devices by what is on screen instead of by pixels — `tap_text("OK")`. Screen reading is uiautomator on Android, Vision OCR on iOS. Registers as a skill for Claude Code and Codex. A separate mode from manual remote control, not a replacement. |
+| **iOS mirroring (macOS only)** | An iPhone attached to the Mac shows up as one more device in the farm, with manual remote control and AI control offered separately. On any other host the iOS entry simply does not appear and everything else keeps working. |
 
 ---
 
@@ -250,6 +252,105 @@ Batch commands report per device. If any device fails or is held by someone else
 
 ---
 
+## Driving devices with an AI agent
+
+The input API speaks in pixels. That is the right interface for a person watching
+the screen, but an agent already knows *what* it wants to press and spends its
+turns working out *where* that is — and a coordinate guessed from a screenshot
+breaks as soon as the screen shifts.
+
+So there is a second vocabulary, alongside the existing one. Manual remote
+control is untouched.
+
+```bash
+python cli.py harness --serial R3CN30ABCDE --owner ai-agent --occupy --release <<'EOF'
+open_app com.android.settings
+wait_stable
+tap_text "Network & internet"
+wait_stable
+elements
+EOF
+```
+
+| Verb | What it does |
+|---|---|
+| `elements` | Everything readable on screen, with the coordinates to press it |
+| `tap_text <text> [n]` | Press the thing that says this (nth match if repeated) |
+| `type_text <string>` | Type |
+| `open_app <package\|app name>` | Launch an app |
+| `wait_stable [seconds]` | Block until the screen stops changing |
+| `screenshot [file]` | Native-resolution PNG |
+| `tap` / `swipe` / `key` / `sleep` | Coordinates and waiting |
+
+**Screen reading differs by platform.** Android uses `uiautomator dump` — the
+device's own view tree, so there is no recognition error and no extra
+dependency. It cannot see inside a WebView, a game surface, or a `FLAG_SECURE`
+window; fall back to `screenshot` and coordinates there. iOS uses macOS Vision
+OCR through phone-harness.
+
+### Registering it as a skill
+
+```bash
+python cli.py skill --target claude   # ~/.claude/skills/qa-device-farm/SKILL.md
+python cli.py skill --target codex    # ~/.codex/skills/qa-device-farm/SKILL.md
+python cli.py skill --base http://farm.internal:8001 --target claude
+```
+
+The `--base` URL is baked into the document, so pass it when the farm lives on
+another host.
+
+### Scripts are interpreted, not executed
+
+`harness` does not `exec` Python. Only verbs from the table above become HTTP
+calls, and a line that is not one of them is rejected **before any line runs**
+(exit code 2). These scripts are usually written by an LLM against a farm that
+is on the network with real devices attached; there is no reason to leave an
+arbitrary-code path open.
+
+---
+
+## iOS mirroring (macOS only)
+
+An iPhone attached to the Mac is handled as one device in the farm
+(`ios-mirror`), with the same two modes Android has, kept separate:
+
+- **Remote control** — `📱 원격 조작` on the dashboard. Watch the screen and
+  click (tap), drag (swipe) and type. Painted by screenshot polling rather than
+  ws-scrcpy.
+- **AI control** — the **same verbs and the same endpoints** as Android.
+  `python cli.py harness --serial ios-mirror ...`
+
+**Requirements:**
+
+1. macOS Sequoia or later, iPhone paired through iPhone Mirroring
+2. [phone-harness](https://github.com/ShawnPana/phone-harness) installed
+   (`~/.phone-harness` recommended, or `phone-harness` on PATH)
+3. Accessibility and Screen Recording permission for the terminal
+
+```bash
+python cli.py health   # check ios.available and ios.reason
+```
+
+On a non-Mac host, or without phone-harness, **the iPhone entry never appears**
+and only the iOS endpoints answer 503 with the reason. Android is unaffected.
+
+**How it differs from Android:**
+
+| | Android | iOS |
+|---|---|---|
+| Mirroring | ws-scrcpy (H.264) | screenshot polling |
+| Screen reading | uiautomator (view tree) | Vision OCR |
+| Text input | ASCII only (IME needed) | no restriction |
+| Key events | keycodes supported | none (use `open_app`) |
+| APK install · logcat · batch | supported | rejected with 400 |
+| Device count | as many as you plug in | one mirror window = one device |
+
+`/api/devices/occupy` ("give me any device") **never hands out the iPhone**. That
+call is where a pipeline asks for an Android, and the iPhone is a single
+GUI-bound device. Claim it explicitly with `--serial ios-mirror`.
+
+---
+
 ## API
 
 The full spec is generated at `http://localhost:8001/docs`. The ones you will actually use:
@@ -290,8 +391,16 @@ The full spec is generated at `http://localhost:8001/docs`. The ones you will ac
 | `POST` | `/api/batch/app` | App control on several devices |
 | `POST` | `/api/batch/macro` | Macro replay on several devices |
 | `POST` | `/api/batch/install` | APK install on several devices |
-| `WS` | `/ws/video/{serial}` | screenrecord H.264 stream |
-| `WS` | `/ws/control/{serial}` | Live input channel |
+| `WS` | `/ws/video/{serial}` | screenrecord H.264 stream (Android only) |
+| `WS` | `/ws/control/{serial}` | Live input channel (iOS uses the same path) |
+| `GET` | `/api/agent/{serial}/elements` | On-screen text with coordinates (uiautomator on Android, OCR on iOS) |
+| `POST` | `/api/agent/{serial}/tap-text` | Press by text (`text`, `index`, `exact`) |
+| `POST` | `/api/agent/{serial}/type-text` | Type |
+| `POST` | `/api/agent/{serial}/open-app` | Launch (`package` on Android, `name` on iOS) |
+| `POST` | `/api/agent/{serial}/wait-stable` | Wait for the screen to settle (`timeout`, `interval`) |
+
+`/api/device/{serial}/screenshot` returns a thumbnail by default; `?full=1`
+gives the native-resolution PNG an agent needs to compute coordinates.
 
 Claiming a device:
 
@@ -340,17 +449,29 @@ python tests/run_all.py
 test_leases_and_input.py     ok       26 passed, 0 failed
 test_features.py             ok      194 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
-test_cli.py                  ok       24 passed, 0 failed
-259 passed, 0 failed across 4 suites
+test_cli.py                  ok       27 passed, 0 failed
+test_agent_verbs.py          ok       53 passed, 0 failed
+test_ios_provider.py         ok       74 passed, 0 failed
+test_cli_harness.py          ok       54 passed, 0 failed
+443 passed, 0 failed across 7 suites
 ```
 
 Each suite runs in its own process with a temporary directory as cwd, so one suite's monkeypatching and runtime state (`device_leases.json`, `macros/`) cannot leak into another, and the working tree stays clean.
 
-What is covered: lease conflicts, TTL expiry and pool exhaustion; input injection rejection; macro rescaling and v1 compatibility; path traversal; app-control argv; crash pattern matching; logcat dead-session recovery and file capture; batch partial-failure isolation; four kinds of wireless serial; the device cache; lease persistence; the access-token boundary; selective cleanup of leftover stream processes; and every CLI subcommand.
+What is covered: lease conflicts, TTL expiry and pool exhaustion; input injection rejection; macro rescaling and v1 compatibility; path traversal; app-control argv; crash pattern matching; logcat dead-session recovery and file capture; batch partial-failure isolation; four kinds of wireless serial; the device cache; lease persistence; the access-token boundary; selective cleanup of leftover stream processes; and every CLI subcommand. Plus the AI verbs
+(uiautomator dump parsing, `tap_text` match ranking, device-shell quoting, `wait_stable`
+convergence), the iOS provider (both available and unavailable, Android-only rejections, batch
+skipping), and the harness runner — specifically that a line outside the verb table never runs.
 
 `cli.py` is driven as a real subprocess, because an argument-handling bug lived there that no in-process test could see.
 
 **Anything that genuinely needs hardware** is not automated: mirroring quality and latency, audio, real crash detection, the wireless switch. Those were verified by hand on real devices.
+
+**Anything that needs a Mac and an iPhone** is in the same category. The iOS tests replace the
+phone-harness adapter with a fake and verify only the farm's side of the contract (device
+listing, leases, rejections, format conversion). Whether the mirror window is actually clicked,
+and what shape Vision OCR results arrive in, has to be confirmed on a Mac — the script templates
+in `ios_mirror.py` are where that verification lands.
 
 ---
 
@@ -374,7 +495,16 @@ The reasoning and the boundaries are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
 
 ## Known limits
 
-- **Android only.** No iOS.
+- **iOS is Mac-only and one device.** It works by driving macOS's iPhone
+  Mirroring window through phone-harness, so the farm server has to run on the
+  Mac and the window has to stay open. One window is one device, and a person
+  using that Mac will fight the agent for it. APK install, logcat and batch
+  operations do not exist for iOS. It is not the plug-in-many-devices model
+  Android gets.
+- **The agent cannot read every screen.** `elements` on Android is uiautomator,
+  so WebView content, game surfaces and `FLAG_SECURE` windows come back empty,
+  and a dump taken mid-animation fails outright (retry after `wait_stable`).
+  Those cases need a screenshot and coordinates.
 - **Authentication is optional and coarse.** Without `DEVICE_FARM_TOKEN`, anyone who can reach the port can drive the devices and install APKs. Fine on an internal network; turn it on before exposing the farm. It is one shared secret, not per-user accounts.
 - **No Korean or emoji input.** `adb shell input text` is ASCII only; the device needs its own IME.
 - **Macros are still coordinate-based.** Resolution differences are corrected by proportional scaling, but devices with a different aspect ratio or a re-flowed layout (foldables, tablets) will not match. It does not find UI elements. Macros recorded before this feature have no resolution and replay unscaled.

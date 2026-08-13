@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>iPhone 원격 조작</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #e0e0e0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Segoe UI', sans-serif;
+        }
+
+        #header {
+            width: 100%;
+            padding: 10px 20px;
+            background: #1e1e1e;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-sizing: border-box;
+        }
+
+        #screen-wrap {
+            margin-top: 20px;
+            border: 2px solid #333;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+            line-height: 0;
+        }
+
+        #screen {
+            background: #000;
+            max-height: 78vh;
+            max-width: 100%;
+            cursor: crosshair;
+            display: block;
+        }
+
+        .btn {
+            background: #bb86fc;
+            color: #000;
+            border: none;
+            padding: 8px 16px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+
+        #toolbar {
+            margin: 14px 0 24px;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        #toolbar input {
+            background: #1e1e1e;
+            border: 1px solid #444;
+            color: #e0e0e0;
+            padding: 8px;
+            border-radius: 4px;
+            min-width: 220px;
+        }
+
+        #status {
+            font-size: 13px;
+            color: #9e9e9e;
+            min-height: 18px;
+            text-align: center;
+            padding: 0 16px;
+            max-width: 640px;
+        }
+
+        .warn {
+            color: #cf6679;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="header">
+        <span id="device-id">iPhone (미러링)</span>
+        <div>
+            <button class="btn" onclick="location.href='/'">대시보드로</button>
+        </div>
+    </div>
+
+    <div id="screen-wrap">
+        <!-- 안드로이드처럼 H.264 스트림을 받을 수 없습니다. 맥의 미러링 창을
+             캡처해서 받는 그림이 전부라, 화면은 폴링으로 갱신합니다. -->
+        <img id="screen" alt="iPhone 화면">
+    </div>
+
+    <div id="toolbar">
+        <input id="text-input" placeholder="입력할 텍스트 (Enter로 전송)">
+        <button class="btn" onclick="sendText()">입력</button>
+    </div>
+
+    <div id="status">연결 중…</div>
+
+    <script>
+        // 대시보드가 토큰을 localStorage에 두고, 이 페이지는 거기서 열리며
+        // 같은 오리진이라 그대로 재사용합니다. (control.html과 동일)
+        function authHeaders(extra) {
+            const h = Object.assign({}, extra || {});
+            const t = localStorage.getItem('farmToken') || '';
+            if (t) h['X-Farm-Token'] = t;
+            return h;
+        }
+        function apiFetch(url, options) {
+            const opts = Object.assign({}, options || {});
+            opts.headers = authHeaders(opts.headers);
+            return fetch(url, opts);
+        }
+        function wsUrlWithToken(path) {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const t = localStorage.getItem('farmToken') || '';
+            return `${proto}//${location.host}${path}` + (t ? `?token=${encodeURIComponent(t)}` : '');
+        }
+
+        const SERIAL = 'ios-mirror';
+        const screen = document.getElementById('screen');
+        const statusLine = document.getElementById('status');
+
+        function setStatus(msg, warn) {
+            statusLine.textContent = msg;
+            statusLine.className = warn ? 'warn' : '';
+        }
+
+        // --- 화면 폴링 ---
+        // 한 장을 받아 그린 다음에 다음 장을 요청합니다. 고정 간격으로 쏘면
+        // phone-harness 한 번 호출이 초 단위로 걸리는 동안 요청만 쌓이고, 맥
+        // 쪽에서 서로를 밀어냅니다.
+        let stopped = false;
+        let currentUrl = null;
+
+        async function pumpFrame() {
+            if (stopped) return;
+            try {
+                const res = await apiFetch(`/api/device/${SERIAL}/screenshot?full=1`);
+                if (res.status === 503) {
+                    const body = await res.json().catch(() => ({}));
+                    setStatus(body.message || '화면을 가져오지 못했습니다. 아이폰 미러링 창이 열려 있는지 확인하세요.', true);
+                } else if (!res.ok) {
+                    setStatus(`화면 요청 실패 (HTTP ${res.status})`, true);
+                } else {
+                    const blob = await res.blob();
+                    const url = URL.createObjectURL(blob);
+                    if (currentUrl) URL.revokeObjectURL(currentUrl);
+                    currentUrl = url;
+                    screen.src = url;
+                    setStatus('연결됨 — 화면을 클릭하면 탭, 드래그하면 스와이프입니다.');
+                }
+            } catch (e) {
+                setStatus(`화면 요청 오류: ${e}`, true);
+            }
+            setTimeout(pumpFrame, 300);
+        }
+        pumpFrame();
+
+        window.addEventListener('beforeunload', () => { stopped = true; });
+
+        // --- 조작 ---
+        // 안드로이드 control.html과 같은 이벤트 형식을 같은 WebSocket 경로로
+        // 보냅니다. 서버가 시리얼을 보고 phone-harness로 넘깁니다.
+        const controlWs = new WebSocket(wsUrlWithToken(`/ws/control/${SERIAL}`));
+        controlWs.onerror = () => setStatus('조작 연결이 끊겼습니다. 새로고침하세요.', true);
+
+        function send(event) {
+            if (controlWs.readyState !== WebSocket.OPEN) {
+                setStatus('조작 연결이 아직 열리지 않았습니다.', true);
+                return;
+            }
+            controlWs.send(JSON.stringify(event));
+        }
+
+        // 표시 크기가 아니라 캡처 원본 픽셀로 보내야 합니다. 스크린샷은
+        // 미러링 창 해상도 그대로이고, 브라우저는 그걸 줄여서 그립니다.
+        function toDevice(e) {
+            const rect = screen.getBoundingClientRect();
+            const sx = (screen.naturalWidth || rect.width) / rect.width;
+            const sy = (screen.naturalHeight || rect.height) / rect.height;
+            return {
+                x: Math.round((e.clientX - rect.left) * sx),
+                y: Math.round((e.clientY - rect.top) * sy),
+            };
+        }
+
+        // 짧게 누르면 탭, 끌면 스와이프. 임계값을 두는 이유는 손이 몇 픽셀
+        // 흔들린 것까지 스와이프로 보내면 목록이 제멋대로 스크롤되기 때문입니다.
+        const DRAG_THRESHOLD = 12;
+        let down = null;
+
+        screen.addEventListener('mousedown', (e) => {
+            down = { ...toDevice(e), at: Date.now() };
+            e.preventDefault();
+        });
+
+        screen.addEventListener('mouseup', (e) => {
+            if (!down) return;
+            const up = toDevice(e);
+            const moved = Math.hypot(up.x - down.x, up.y - down.y);
+            if (moved < DRAG_THRESHOLD) {
+                send({ type: 'tap', x: up.x, y: up.y });
+            } else {
+                send({
+                    type: 'swipe', x1: down.x, y1: down.y, x2: up.x, y2: up.y,
+                    duration: Math.max(100, Math.min(1500, Date.now() - down.at)),
+                });
+            }
+            down = null;
+        });
+
+        screen.addEventListener('mouseleave', () => { down = null; });
+        screen.addEventListener('dragstart', (e) => e.preventDefault());
+
+        function sendText() {
+            const box = document.getElementById('text-input');
+            const value = box.value;
+            if (!value) return;
+            // 안드로이드와 달리 한글도 그대로 갑니다 — 맥이 키 이벤트를 만듭니다.
+            send({ type: 'text', text: value });
+            box.value = '';
+        }
+
+        document.getElementById('text-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') sendText();
+        });
+    </script>
+</body>
+
+</html>

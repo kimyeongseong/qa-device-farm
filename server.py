@@ -13,6 +13,10 @@ import re
 import hmac
 from pydantic import BaseModel
 
+# iOS 미러링은 맥 + phone-harness가 있을 때만 켜집니다. 임포트 자체는 어디서든
+# 되고(플랫폼 검사는 호출 시점), 없으면 iOS 경로만 503으로 막힙니다.
+import ios_mirror as ios
+
 # This server echoes device output — logcat lines, app names, adb errors — and
 # those routinely carry characters the console codepage cannot encode (emoji on
 # a cp949 Windows console). An unencodable print raises UnicodeEncodeError from
@@ -100,6 +104,63 @@ def token_ok(request: Request) -> bool:
     # timing the response.
     return hmac.compare_digest(supplied, FARM_TOKEN)
 
+# --- 안드로이드 전용 경로 ---
+# 아이폰은 팜 안에서 기기처럼 보이지만 adb가 없습니다. APK 설치나 logcat을
+# 아이폰 시리얼로 부르면 adb가 "device not found"를 뱉는데, 그 메시지로는
+# 무엇이 잘못됐는지 알 수 없습니다. 엔드포인트 열다섯 곳에 같은 검사를 복사하는
+# 대신 경로 한 곳에서 막고 이유를 말합니다.
+ANDROID_ONLY_PREFIXES = {
+    "/api/install/": "APK 설치",
+    "/api/uninstall/": "패키지 삭제",
+    "/api/packages/": "패키지 목록",
+    "/api/info/": "기기 상세 정보",
+    "/api/wireless/": "무선 디버깅",
+    "/api/usb/": "USB 전환",
+    "/api/app/": "앱 제어",
+    "/api/logcat/": "logcat 수집",
+    "/api/audio/": "오디오 포워딩",
+    "/api/macros/": "매크로",
+}
+
+def topic_particle(word: str) -> str:
+    """'은' 또는 '는'. 한글 받침 유무로 갈립니다.
+
+    기능 이름을 메시지에 끼워 넣는 자리가 여기뿐이라 '은(는)'으로 때울 수도
+    있지만, 이 팜의 다른 오류 메시지는 전부 사람이 쓴 문장입니다. 하나만
+    기계처럼 보이면 그게 눈에 띕니다.
+    """
+    if not word:
+        return "는"
+    last = word.rstrip()[-1]
+    if "가" <= last <= "힣":
+        return "은" if (ord(last) - 0xAC00) % 28 else "는"
+    return "은(는)"  # 숫자나 영문으로 끝나면 읽는 법이 갈립니다.
+
+def android_only_feature(path: str):
+    """이 경로가 아이폰 시리얼을 받았고 안드로이드 전용이면 그 기능 이름."""
+    if ios.IOS_SERIAL not in path.split("/"):
+        return None
+    if path.endswith("/reset-stream"):
+        return "스트림 정리"
+    for prefix, label in ANDROID_ONLY_PREFIXES.items():
+        if path.startswith(prefix):
+            return label
+    return None
+
+@app.middleware("http")
+async def block_ios_on_android_paths(request: Request, call_next):
+    feature = android_only_feature(request.url.path)
+    if feature:
+        return JSONResponse(
+            {"status": "error",
+             "message": f"{feature}{topic_particle(feature)} 안드로이드 전용입니다 "
+                        f"(iOS 미러링 기기에서는 쓸 수 없습니다)"},
+            status_code=400)
+    return await call_next(request)
+
+# 토큰 검사는 이 아래에 둡니다. Starlette은 나중에 등록된 미들웨어를 바깥에
+# 두므로, 인증이 먼저 걸리고 그 다음에 위 경로 검사가 돕니다 — 토큰 없이
+# 부른 요청이 400으로 먼저 튕겨 나가지 않게.
 @app.middleware("http")
 async def require_token(request: Request, call_next):
     if not FARM_TOKEN or request.method == "OPTIONS":
@@ -330,11 +391,54 @@ async def adb_exec(adb_path: str, serial: str, *args: str):
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode(errors="replace").strip() or f"adb exited {proc.returncode}")
 
+async def adb_capture(adb_path: str, serial: str, *args: str) -> str:
+    """adb_exec's sibling for commands whose output is the point.
+
+    Same argv-only rule. adb_exec throws stdout away, which is right for input
+    injection and wrong for anything that reads the device back.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        adb_path, "-s", serial, *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(stderr.decode(errors="replace").strip() or f"adb exited {proc.returncode}")
+    return stdout.decode("utf-8", errors="replace")
+
 def as_int(value, name: str) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         raise ValueError(f"'{name}' must be an integer, got {value!r}")
+
+def android_text_arg(text: str) -> str:
+    """Make one argument for `adb shell input text`.
+
+    Two things bite here, and both were live.
+
+    Passing the string as a single argv entry is not enough: adb concatenates
+    the shell command and the *device* shell splits it again, so "hello world"
+    arrived as `input text hello world` and only "hello" was typed. `input`
+    reads a space as %s, so spaces are encoded rather than passed through.
+
+    The same second split is an injection path -- a text of `a; reboot` ran as
+    two device-shell commands. Wrapping the argument in single quotes (with the
+    usual '\\'' dance for embedded quotes) makes the device shell treat it as one
+    inert word.
+
+    Non-ASCII still cannot be typed this way: `input text` speaks ASCII only and
+    Korean or emoji need an IME on the device. Say so instead of silently
+    dropping characters.
+    """
+    if not text.isascii():
+        raise ValueError("'text' supports ASCII only; install an IME for other scripts")
+    # Control characters have no representation here and would end the command.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        raise ValueError("'text' cannot contain control characters")
+    quoted = text.replace("'", "'\\''")
+    return "'" + quoted.replace(" ", "%s") + "'"
 
 async def dispatch_input(adb_path: str, serial: str, event: dict):
     """Turn one control event into a single `adb shell input` call."""
@@ -356,68 +460,145 @@ async def dispatch_input(adb_path: str, serial: str, event: dict):
         await adb_exec(adb_path, serial, "shell", "input", "keyevent", str(keycode))
 
     elif etype == "text":
-        # `input text` only carries ASCII. Korean and emoji need an IME on the
-        # device; this endpoint does not pretend otherwise.
         text = str(event.get("text", ""))
-        if not text.isascii():
-            raise ValueError("'text' supports ASCII only; install an IME for other scripts")
-        await adb_exec(adb_path, serial, "shell", "input", "text", text)
+        await adb_exec(adb_path, serial, "shell", "input", "text", android_text_arg(text))
 
     else:
         raise ValueError(f"Unknown event type: {etype!r}")
 # -----------------------
 
-@app.get("/api/device/{serial}/screenshot")
-async def get_device_screenshot(serial: str):
+# --- iOS 분기 헬퍼 ---
+# 아이폰은 팜 안에서 기기 한 대처럼 보이지만, 뒤에 adb가 아니라 phone-harness가
+# 있습니다. 기존 핸들러를 갈라 놓는 대신 진입부에서 이쪽으로 넘깁니다 — 점유
+# 검사나 녹화 같은 공통 규칙은 갈라지기 전에 이미 지나갑니다.
+
+def ios_unavailable_response():
+    return JSONResponse({"status": "error", "message": ios.ios_status()["reason"]},
+                        status_code=503)
+
+async def ios_screenshot_response(full: bool):
+    if not ios.available():
+        return JSONResponse({"status": "error", "message": ios.ios_status()["reason"]},
+                            status_code=503)
     try:
+        data = await ios.adapter.screenshot(full=full)
+    except Exception as e:
+        print(f"[{ios.IOS_SERIAL}] Screenshot Error: {e}")
+        return Response(status_code=503)
+    return Response(content=data, media_type="image/png" if full else "image/jpeg")
+
+async def ios_dispatch_ws(serial: str, event: dict):
+    """WebSocket 조작용. HTTP와 달리 응답 객체가 아니라 예외로 실패를 알립니다."""
+    etype = event.get("type")
+    if etype == "tap":
+        await ios.adapter.tap(as_int(event.get("x"), "x"), as_int(event.get("y"), "y"))
+    elif etype == "swipe":
+        await ios.adapter.swipe(
+            as_int(event.get("x1"), "x1"), as_int(event.get("y1"), "y1"),
+            as_int(event.get("x2"), "x2"), as_int(event.get("y2"), "y2"),
+            as_int(event.get("duration", 300), "duration"))
+    elif etype == "text":
+        await ios.adapter.type_text(str(event.get("text", "")))
+    else:
+        raise ValueError(f"iOS에서 지원하지 않는 이벤트입니다: {etype!r}")
+
+async def ios_input(event: dict):
+    """안드로이드 dispatch_input과 같은 이벤트를 아이폰에서 실행합니다."""
+    if not ios.available():
+        return ios_unavailable_response()
+
+    etype = event.get("type")
+    try:
+        if etype == "tap":
+            await ios.adapter.tap(as_int(event.get("x"), "x"), as_int(event.get("y"), "y"))
+        elif etype == "swipe":
+            await ios.adapter.swipe(
+                as_int(event.get("x1"), "x1"), as_int(event.get("y1"), "y1"),
+                as_int(event.get("x2"), "x2"), as_int(event.get("y2"), "y2"),
+                as_int(event.get("duration", 300), "duration"))
+        elif etype == "text":
+            await ios.adapter.type_text(str(event.get("text", "")))
+        elif etype == "key":
+            # 안드로이드 keycode는 아이폰에 대응이 없습니다. 홈/앱 전환은
+            # open_app으로 하세요.
+            return JSONResponse(
+                {"status": "error",
+                 "message": "iOS는 keycode 입력을 지원하지 않습니다 (open-app을 쓰세요)"},
+                status_code=400)
+        else:
+            return JSONResponse({"status": "error", "message": f"Unknown event type: {etype!r}"},
+                                status_code=400)
+    except ValueError as bad:
+        return JSONResponse({"status": "error", "message": str(bad)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+    return {"status": "success"}
+
+def capture_screenshot_bytes(serial: str, full: bool = False, size=None):
+    """One screenshot as encoded bytes. Blocking -- call it in a thread.
+
+    The dashboard polls this at thumbnail size, but an agent reading the screen
+    needs the pixels the device actually has: it maps what it sees back to tap
+    coordinates, and a 300x600 thumbnail of a 1080x2400 phone puts every tap in
+    the wrong place. `full` keeps the native resolution and encodes PNG so text
+    stays readable; `size` is for internal callers that want something smaller
+    still (wait_stable compares frames, it does not need detail).
+    """
+    import io
+
+    d = adb.device(serial=serial)
+
+    # Retry logic for unstable connections
+    img = None
+    for attempt in range(2):
+        try:
+            img = d.screenshot()
+            break
+        except Exception as attempt_msg:
+            print(f"[{serial}] Screenshot attempt {attempt+1} failed: {attempt_msg}")
+            if attempt == 1:
+                # If failure persists, return empty or error image instead of crashing server
+                return None, None
+
+    if not img:
+        return None, None
+
+    buf = io.BytesIO()
+    try:
+        if full:
+            img.save(buf, format="PNG")
+            media = "image/png"
+        else:
+            img.thumbnail(size or (300, 600))
+            img.save(buf, format="JPEG", quality=60)
+            media = "image/jpeg"
+    except Exception as save_err:
+        print(f"[{serial}] Image Save Error: {save_err}")
+        return None, None
+
+    buf.seek(0)
+    return buf.getvalue(), media
+
+@app.get("/api/device/{serial}/screenshot")
+async def get_device_screenshot(serial: str, full: bool = False):
+    """The device screen. `?full=1` for native resolution PNG (agent use)."""
+    try:
+        if ios.is_ios(serial):
+            return await ios_screenshot_response(full)
+
         lock = get_device_lock(serial)
-        
+
         # Acquire lock to ensure only one screenshot per device at a time
         async with lock:
-            loop = asyncio.get_event_loop()
-            
-            def capture_task():
-                import io
-                
-                d = adb.device(serial=serial)
-                
-                # Retry logic for unstable connections
-                img = None
-                for attempt in range(2):
-                    try:
-                        img = d.screenshot()
-                        break
-                    except Exception as attempt_msg:
-                         print(f"[{serial}] Screenshot attempt {attempt+1} failed: {attempt_msg}")
-                         if attempt == 1: 
-                             # If failure persists, return empty or error image instead of crashing server
-                             return None
-                
-                if not img: return None
+            img_bytes, media = await asyncio.to_thread(capture_screenshot_bytes, serial, full)
 
-                # Resize optimization
-                img.thumbnail((300, 600))
-                
-                # Convert to JPEG
-                buf = io.BytesIO()
-                try:
-                    img.save(buf, format="JPEG", quality=60)
-                except Exception as save_err:
-                    print(f"[{serial}] Image Save Error: {save_err}")
-                    return None
-                    
-                buf.seek(0)
-                return buf.getvalue()
-
-            # Run blocking ADB/Image code in thread pool
-            img_bytes = await loop.run_in_executor(None, capture_task)
-            
             if img_bytes is None:
                 # Return a placeholder or 503 Service Unavailable (but 200 with error msg might be safer for frontend polling)
                 # Let's return 404 or 503 so frontend knows to retry silently
                 return Response(status_code=503)
-            
-            return Response(content=img_bytes, media_type="image/jpeg")
+
+            return Response(content=img_bytes, media_type=media)
 
     except Exception as e:
         print(f"[{serial}] Screenshot Error: {e}")
@@ -443,6 +624,11 @@ def ws_token_ok(websocket: WebSocket) -> bool:
 async def websocket_video_endpoint(websocket: WebSocket, serial: str):
     if not ws_token_ok(websocket):
         await websocket.close(code=1008, reason="token required")
+        return
+    if ios.is_ios(serial):
+        # 아이폰에는 screenrecord가 없습니다. 원격 화면은 /static/ios.html이
+        # 스크린샷 폴링으로 그립니다.
+        await websocket.close(code=1008, reason="iOS는 스크린샷 폴링으로 봅니다 (/static/ios.html)")
         return
     await websocket.accept()
     print(f"[{serial}] Video WS Connected")
@@ -506,7 +692,10 @@ async def websocket_control_endpoint(websocket: WebSocket, serial: str):
             # -----------------------
 
             try:
-                await dispatch_input(adb_path, serial, event)
+                if ios.is_ios(serial):
+                    await ios_dispatch_ws(serial, event)
+                else:
+                    await dispatch_input(adb_path, serial, event)
             except ValueError as bad_event:
                 # A malformed event should not tear down the whole session.
                 print(f"[{serial}] Ignored event: {bad_event}")
@@ -684,6 +873,7 @@ def collect_devices(refresh: bool):
 
                 devices.append({
                     "serial": d.serial,
+                    "platform": "android",
                     "model": model,
                     "version": version,
                     "width": width,
@@ -706,6 +896,7 @@ def collect_devices(refresh: bool):
                 print(f"Error reading device {d.serial}: {e}", flush=True)
                 devices.append({
                     "serial": d.serial,
+                    "platform": "android",
                     "model": device_aliases.get(d.serial, d.serial),
                     "version": "?", "width": 0, "height": 0,
                     "ip": "?", "sdk": "?", "battery": "?",
@@ -721,6 +912,7 @@ def collect_devices(refresh: bool):
                 continue
             devices.append({
                 "serial": serial,
+                "platform": "android",
                 "model": device_aliases.get(serial, serial),
                 "version": "?", "width": 0, "height": 0,
                 "ip": "?", "sdk": "?", "battery": "?",
@@ -729,6 +921,14 @@ def collect_devices(refresh: bool):
                 "state_hint": STATE_LABELS.get(state, f"사용 불가 상태: {state}"),
                 "occupied_by": None, "occupied_until": None
             })
+
+        # 미러링 중인 아이폰은 기기 한 대로 같이 실립니다. 맥이 아니거나
+        # phone-harness가 없으면 줄 자체가 없습니다 — 안드로이드만 쓰는 팜에
+        # 쓸 수 없는 칸이 하나 더 생기는 게 더 나쁩니다.
+        if ios.available():
+            devices.append(ios.device_entry(
+                lease=get_lease(ios.IOS_SERIAL),
+                alias=device_aliases.get(ios.IOS_SERIAL)))
 
         return {"devices": devices}
     except Exception as e:
@@ -1078,6 +1278,8 @@ async def send_input(serial: str, req: InputRequest):
     if conflict:
         return conflict
     event = req.model_dump(exclude_none=True)
+    if ios.is_ios(serial):
+        return await ios_input(event)
     try:
         await dispatch_input(get_adb_path(), serial, event)
     except ValueError as bad_event:
@@ -1095,6 +1297,333 @@ async def send_input(serial: str, req: InputRequest):
         active_recordings[serial].append(step)
 
     return {"status": "success"}
+
+# --- AI Agent Verbs ---
+# The input API above speaks in pixels: an agent that has to compute them first
+# spends most of its turns guessing. These verbs are the vocabulary an agent
+# actually uses -- read the screen, press the thing that says X, type, wait for
+# the screen to settle -- and they are the same five calls on both platforms.
+#
+# Why uiautomator and not OCR on Android: the device already knows its own view
+# tree, with text and exact bounds, and reading it costs no extra dependency and
+# no recognition error. OCR earns its place on iOS, where the mirror window is
+# all we get. The gap is real and documented: uiautomator sees nothing inside a
+# WebView, a game canvas, or a FLAG_SECURE window -- fall back to screenshot()
+# and coordinates there.
+#
+# Lease policy matches the rest of the farm: verbs that change the device need
+# the lease, verbs that only look at it do not (screenshot never has).
+
+BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+
+def parse_bounds(raw: str):
+    """`[0,84][1080,252]` -> a rect plus its centre, or None if it is not one."""
+    m = BOUNDS_RE.search(raw or "")
+    if not m:
+        return None
+    x1, y1, x2, y2 = (int(v) for v in m.groups())
+    return {
+        "bounds": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        "center": {"x": (x1 + x2) // 2, "y": (y1 + y2) // 2},
+    }
+
+def parse_ui_dump(xml_text: str):
+    """Turn a uiautomator dump into the element list the verbs work on.
+
+    Nodes without text and without a content-desc are dropped: they are layout
+    containers, and handing an agent four hundred FrameLayouts buries the six
+    things it can actually press.
+    """
+    import xml.etree.ElementTree as ET
+
+    # `uiautomator dump` prints a human line after the XML on some builds
+    # ("UI hierchary dumped to: ..." -- their spelling), which is not valid XML.
+    start = xml_text.find("<?xml")
+    if start == -1:
+        start = xml_text.find("<hierarchy")
+    if start == -1:
+        raise ValueError("uiautomator 덤프에서 XML을 찾지 못했습니다")
+    end = xml_text.rfind("</hierarchy>")
+    body = xml_text[start:end + len("</hierarchy>")] if end != -1 else xml_text[start:]
+
+    root = ET.fromstring(body)
+    elements = []
+    for node in root.iter("node"):
+        text = (node.get("text") or "").strip()
+        desc = (node.get("content-desc") or "").strip()
+        if not text and not desc:
+            continue
+        rect = parse_bounds(node.get("bounds", ""))
+        if not rect:
+            continue
+        elements.append({
+            "text": text,
+            "content_desc": desc,
+            "resource_id": node.get("resource-id") or "",
+            "class": node.get("class") or "",
+            "clickable": node.get("clickable") == "true",
+            "enabled": node.get("enabled") == "true",
+            **rect,
+        })
+    return elements
+
+async def dump_ui_elements(serial: str):
+    """Read the device's view tree.
+
+    `exec-out uiautomator dump /dev/tty` is one round trip, but some vendor
+    builds refuse /dev/tty, so fall back to writing a file and reading it back.
+    Held under the device lock: uiautomator and screencap fight over the device
+    and the loser returns an empty dump.
+    """
+    adb_path = get_adb_path()
+    async with get_device_lock(serial):
+        try:
+            out = await adb_capture(adb_path, serial, "exec-out",
+                                    "uiautomator", "dump", "/dev/tty")
+            return parse_ui_dump(out)
+        except Exception as direct_err:
+            print(f"[{serial}] uiautomator /dev/tty dump failed: {direct_err}")
+
+        remote = "/sdcard/window_dump.xml"
+        await adb_exec(adb_path, serial, "shell", "uiautomator", "dump", remote)
+        try:
+            out = await adb_capture(adb_path, serial, "exec-out", "cat", remote)
+        finally:
+            try:
+                await adb_exec(adb_path, serial, "shell", "rm", "-f", remote)
+            except Exception:
+                pass  # A leftover dump file is not worth failing the call over.
+        return parse_ui_dump(out)
+
+def find_elements(elements, text: str, exact: bool = False):
+    """Elements whose text or content-desc matches, best matches first.
+
+    Exact hits are ranked ahead of partial ones even in loose mode, so
+    tap_text("확인") presses the button that says 확인 rather than the label that
+    says "확인하려면 여기를 누르세요".
+    """
+    needle = (text or "").strip()
+    if not needle:
+        return []
+    lowered = needle.casefold()
+
+    exact_hits, loose_hits = [], []
+    for el in elements:
+        for field in (el["text"], el["content_desc"]):
+            if not field:
+                continue
+            if field.strip() == needle or field.strip().casefold() == lowered:
+                exact_hits.append(el)
+                break
+            if not exact and lowered in field.casefold():
+                loose_hits.append(el)
+                break
+    return exact_hits + loose_hits
+
+def images_similar(a: bytes, b: bytes, threshold: float) -> bool:
+    """Do two screenshots show the same thing?
+
+    Downscaled to 64px grayscale first: a live screen never produces two
+    byte-identical frames (clock, blinking cursor, compression noise), so an
+    equality check would report "never stable" on a device that is sitting
+    still. The mean per-pixel difference, as a fraction of full scale, is what
+    the threshold is measured in.
+    """
+    import io
+    from PIL import Image, ImageChops, ImageStat
+
+    if not a or not b:
+        return False
+    ia = Image.open(io.BytesIO(a)).convert("L").resize((64, 64))
+    ib = Image.open(io.BytesIO(b)).convert("L").resize((64, 64))
+    diff = ImageChops.difference(ia, ib)
+    return (ImageStat.Stat(diff).mean[0] / 255.0) <= threshold
+
+async def agent_screen_frame(serial: str):
+    """A small screenshot for comparison purposes, on either platform."""
+    if ios.is_ios(serial):
+        return await ios.adapter.screenshot(full=False)
+    async with get_device_lock(serial):
+        data, _ = await asyncio.to_thread(capture_screenshot_bytes, serial, False, (200, 400))
+    return data
+
+class TapTextRequest(BaseModel):
+    text: str
+    index: int = 0
+    exact: bool = False
+    owner: str = None
+
+class TypeTextRequest(BaseModel):
+    text: str
+    owner: str = None
+
+class OpenAppRequest(BaseModel):
+    # Android identifies an app by package, iOS by the name on the home screen.
+    package: str = None
+    name: str = None
+    owner: str = None
+
+class WaitStableRequest(BaseModel):
+    timeout: float = 10.0
+    interval: float = 0.5
+    threshold: float = 0.02
+    owner: str = None
+
+def agent_error(message: str, status: int = 400):
+    return JSONResponse({"status": "error", "message": message}, status_code=status)
+
+@app.get("/api/agent/{serial}/elements")
+async def agent_elements(serial: str):
+    """What is on the screen right now, with the coordinates to press it."""
+    try:
+        if ios.is_ios(serial):
+            if not ios.available():
+                return ios_unavailable_response()
+            elements = await ios.adapter.ocr()
+            size = await ios.adapter.screen_size()
+        else:
+            elements = await dump_ui_elements(serial)
+            size = await asyncio.to_thread(get_device_resolution, serial)
+    except ValueError as bad:
+        return agent_error(str(bad))
+    except Exception as e:
+        # An agent that gets this usually asked mid-animation; tell it what to do.
+        return agent_error(
+            f"화면을 읽지 못했습니다: {e} (화면 전환 중이면 wait-stable 후 다시 시도하세요)",
+            status=503)
+
+    width, height = size if size else (0, 0)
+    return {"status": "success", "count": len(elements),
+            "width": width, "height": height, "elements": elements}
+
+@app.post("/api/agent/{serial}/tap-text")
+async def agent_tap_text(serial: str, req: TapTextRequest):
+    """Press the thing that says X. The coordinates are our problem, not the agent's."""
+    conflict = lease_conflict(serial, req.owner)
+    if conflict:
+        return conflict
+
+    try:
+        if ios.is_ios(serial):
+            if not ios.available():
+                return ios_unavailable_response()
+            elements = await ios.adapter.ocr()
+        else:
+            elements = await dump_ui_elements(serial)
+    except Exception as e:
+        return agent_error(f"화면을 읽지 못했습니다: {e}", status=503)
+
+    matches = find_elements(elements, req.text, req.exact)
+    if not matches:
+        return agent_error(
+            f"화면에서 '{req.text}' 텍스트를 찾지 못했습니다 "
+            f"(보이는 텍스트 {len(elements)}개). elements로 확인하세요.",
+            status=404)
+    if req.index >= len(matches):
+        return agent_error(
+            f"'{req.text}' 일치 항목은 {len(matches)}개인데 index={req.index}를 요청했습니다")
+
+    target = matches[req.index]
+    center = target["center"]
+    try:
+        if ios.is_ios(serial):
+            await ios.adapter.tap(center["x"], center["y"])
+        else:
+            # Through dispatch_input, not straight to adb: every input the farm
+            # sends goes past one validation point, this one included.
+            await dispatch_input(get_adb_path(), serial,
+                                 {"type": "tap", "x": center["x"], "y": center["y"]})
+            record_agent_step(serial, {"type": "tap", **center})
+    except Exception as e:
+        return agent_error(str(e), status=500)
+
+    return {"status": "success", "tapped": target, "matches": len(matches)}
+
+@app.post("/api/agent/{serial}/type-text")
+async def agent_type_text(serial: str, req: TypeTextRequest):
+    conflict = lease_conflict(serial, req.owner)
+    if conflict:
+        return conflict
+    try:
+        if ios.is_ios(serial):
+            if not ios.available():
+                return ios_unavailable_response()
+            await ios.adapter.type_text(req.text)
+        else:
+            await dispatch_input(get_adb_path(), serial, {"type": "text", "text": req.text})
+            record_agent_step(serial, {"type": "text", "text": req.text})
+    except ValueError as bad:
+        return agent_error(str(bad))
+    except Exception as e:
+        return agent_error(str(e), status=500)
+    return {"status": "success"}
+
+@app.post("/api/agent/{serial}/open-app")
+async def agent_open_app(serial: str, req: OpenAppRequest):
+    conflict = lease_conflict(serial, req.owner)
+    if conflict:
+        return conflict
+
+    if ios.is_ios(serial):
+        if not ios.available():
+            return ios_unavailable_response()
+        if not req.name:
+            return agent_error("iOS는 앱 이름이 필요합니다: {\"name\": \"Notes\"}")
+        try:
+            await ios.adapter.open_app(req.name)
+        except Exception as e:
+            return agent_error(str(e), status=500)
+        return {"status": "success", "name": req.name}
+
+    if not req.package:
+        return agent_error("안드로이드는 패키지명이 필요합니다: "
+                           "{\"package\": \"com.android.settings\"}")
+    try:
+        # Same monkey launch the dashboard's app control uses.
+        await run_app_action(serial, "launch", req.package)
+    except ValueError as bad:
+        return agent_error(str(bad))
+    except Exception as e:
+        return agent_error(str(e), status=500)
+    return {"status": "success", "package": req.package}
+
+@app.post("/api/agent/{serial}/wait-stable")
+async def agent_wait_stable(serial: str, req: WaitStableRequest):
+    """Block until the screen stops changing.
+
+    A timeout answers 200 with stable=false on purpose. "The screen is still
+    moving" is information the agent acts on -- it waits again, or gives up and
+    reads anyway -- not a server fault, and a 5xx would just make it retry the
+    whole call.
+    """
+    if ios.is_ios(serial) and not ios.available():
+        return ios_unavailable_response()
+
+    deadline = time.monotonic() + max(0.1, req.timeout)
+    interval = min(max(0.05, req.interval), 5.0)
+    started = time.monotonic()
+    checks = 0
+
+    try:
+        previous = await agent_screen_frame(serial)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(interval)
+            current = await agent_screen_frame(serial)
+            checks += 1
+            if previous and current and images_similar(previous, current, req.threshold):
+                return {"status": "success", "stable": True,
+                        "waited": round(time.monotonic() - started, 2), "checks": checks}
+            previous = current
+    except Exception as e:
+        return agent_error(f"화면을 비교하지 못했습니다: {e}", status=503)
+
+    return {"status": "success", "stable": False,
+            "waited": round(time.monotonic() - started, 2), "checks": checks}
+
+def record_agent_step(serial: str, step: dict):
+    """Agent verbs land in a running macro recording like any other input."""
+    if serial in active_recordings:
+        active_recordings[serial].append({**step, "timestamp": time.time()})
 
 def adb_server_info():
     """Which adb server is answering on port 5037, and does it look stale.
@@ -1148,6 +1677,9 @@ def check_health():
             # connection dies with it. That failure is invisible from the client
             # path alone, so surface what is actually answering on port 5037.
             "adb_server": adb_server_info(),
+            # iOS는 있으면 좋고 없으면 그만인 부가 기능이라 status에 영향을
+            # 주지 않습니다. 다만 왜 안 보이는지는 여기서 말합니다.
+            "ios": ios.ios_status(),
         }
     except Exception as e:
         return JSONResponse(
@@ -1666,6 +2198,11 @@ async def gather_per_device(serials, coro_factory, owner=None):
         raise ValueError("No serials given")
 
     async def one(serial):
+        # 배치는 안드로이드 기기용입니다. 아이폰이 섞여 들어오면 나머지를
+        # 실패시키지 않고 그 한 줄만 건너뜁니다 — 점유된 기기와 같은 처리입니다.
+        if ios.is_ios(serial):
+            return {"serial": serial, "status": "skipped",
+                    "message": "iOS 미러링 기기는 배치 작업 대상이 아닙니다"}
         blocked = lease_block_reason(serial, owner)
         if blocked:
             return {"serial": serial, "status": "skipped", "message": blocked}
@@ -1910,6 +2447,12 @@ if __name__ == "__main__":
         print("              still work because adbutils uses the adb server.")
         print("              Install platform-tools on PATH, or copy adb into")
         print("              scrcpy_bin/.")
+    ios_state = ios.ios_status()
+    if ios_state["available"]:
+        print(f"  iOS         phone-harness {ios_state['binary']}")
+        print(f"              iPhone shows up as '{ios.IOS_SERIAL}'")
+    else:
+        print(f"  iOS         off - {ios_state['reason']}")
     if FARM_TOKEN:
         print("  Access      token required (DEVICE_FARM_TOKEN is set)")
     else:
