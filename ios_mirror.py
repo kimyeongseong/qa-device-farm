@@ -111,25 +111,51 @@ def available() -> bool:
     return ios_status()["available"]
 
 
+# --- 좌표계 ---
+# phone-harness는 **맥 화면 좌표(screen points)**로 말합니다. `tap(x, y)`도,
+# `ocr()`이 돌려주는 중심점도 전부 그쪽입니다. 그런데 팜의 조작 API는 안드로이드
+# 기준으로 **스크린샷 이미지의 픽셀**입니다 — 대시보드도 에이전트도 화면을 보고
+# 그 위의 좌표를 보냅니다.
+#
+# 두 좌표계가 API 밖으로 새어 나가면 아이폰만 다른 규칙이 됩니다. 그래서 경계인
+# 여기서 변환합니다: 팜은 어느 플랫폼이든 이미지 픽셀로 말하고, 아이폰 쪽 변환은
+# harness 스크립트 안에서 `screen_info()`로 그때그때 계산합니다(창을 옮기거나
+# 크기를 바꿔도 맞도록).
+
 # --- phone-harness 스크립트 템플릿 (상수) ---
-# 값은 환경변수로만 들어옵니다. 결과는 마지막 줄에 JSON 한 줄로 찍습니다 —
-# harness 자체가 뭘 출력하든 마지막 줄만 읽으면 되도록.
+# 값은 환경변수로만 들어옵니다. 결과는 `__FARM__` 접두사가 붙은 JSON 한 줄로
+# 찍습니다 — harness나 pyobjc가 무엇을 더 출력하든 그 줄만 골라 읽으면 되도록.
 
 _PRELUDE = """
 import json, os
 def _emit(payload):
     print("__FARM__" + json.dumps(payload, ensure_ascii=False))
+
+def _scale():
+    # (창 원점, 이미지픽셀 -> 화면포인트 배율). screen_info()는 캡처를 한 번
+    # 하므로 창을 옮겨도 맞습니다.
+    info = screen_info()
+    win, (iw, ih) = info["window"], info["img_px"]
+    return win, win["w"] / iw, win["h"] / ih
+
+def _to_points(x, y, win, sx, sy):
+    return win["x"] + float(x) * sx, win["y"] + float(y) * sy
 """
 
 SCRIPTS = {
     "tap": _PRELUDE + """
-tap(int(os.environ["PH_X"]), int(os.environ["PH_Y"]))
+win, sx, sy = _scale()
+gx, gy = _to_points(os.environ["PH_X"], os.environ["PH_Y"], win, sx, sy)
+tap(gx, gy)
 _emit({"ok": True})
 """,
+    # 좌표 스와이프는 helpers.swipe가 아니라 drag입니다 — swipe()는 방향
+    # 문자열('up'/'down')을 받는 다른 함수입니다.
     "swipe": _PRELUDE + """
-swipe(int(os.environ["PH_X1"]), int(os.environ["PH_Y1"]),
-      int(os.environ["PH_X2"]), int(os.environ["PH_Y2"]),
-      duration=float(os.environ["PH_DURATION"]) / 1000.0)
+win, sx, sy = _scale()
+x1, y1 = _to_points(os.environ["PH_X1"], os.environ["PH_Y1"], win, sx, sy)
+x2, y2 = _to_points(os.environ["PH_X2"], os.environ["PH_Y2"], win, sx, sy)
+drag(x1, y1, x2, y2, duration=max(0.05, float(os.environ["PH_DURATION"]) / 1000.0))
 _emit({"ok": True})
 """,
     "type_text": _PRELUDE + """
@@ -140,17 +166,44 @@ _emit({"ok": True})
 open_app(os.environ["PH_NAME"])
 _emit({"ok": True})
 """,
+    # ocr()은 화면 포인트 기준 중심점을 돌려주므로, 팜이 쓰는 이미지 픽셀로
+    # 되돌려서 내보냅니다.
     "ocr": _PRELUDE + """
-_emit({"ok": True, "items": ocr()})
+win, sx, sy = _scale()
+items = []
+for o in ocr():
+    items.append({
+        "text": o["text"],
+        "confidence": o.get("confidence"),
+        "cx": (o["x"] - win["x"]) / sx,
+        "cy": (o["y"] - win["y"]) / sy,
+        "w": o["w"] / sx,
+        "h": o["h"] / sy,
+    })
+_emit({"ok": True, "items": items, "img": [win["w"] / sx, win["h"] / sy]})
 """,
     "screenshot": _PRELUDE + """
-_img = screenshot(os.environ["PH_OUT"])
+screenshot(os.environ["PH_OUT"])
 _emit({"ok": True, "path": os.environ["PH_OUT"]})
 """,
     "wait_stable": _PRELUDE + """
-wait_stable(timeout=float(os.environ["PH_TIMEOUT"]))
-_emit({"ok": True})
+_emit({"ok": True, "stable": bool(wait_stable(timeout=float(os.environ["PH_TIMEOUT"])))})
 """,
+    # 미러링이 끊겼는지, 왜 끊겼는지. phone-harness는 연결 화면을 대신 눌러주지
+    # 않습니다(사용자가 직접 해야 하는 물리 동작이라고 못박아 뒀습니다). 그
+    # 판단을 팜도 그대로 존중하고, 사용자에게 이유만 전달합니다.
+    "state": _PRELUDE + """
+_emit({"ok": True, "state": connection_state()})
+""",
+}
+
+# connection_state()가 돌려주는 값 -> 사람이 읽을 한국어 사유.
+STATE_HINTS = {
+    "ready": None,
+    "not-running": "맥에서 '아이폰 미러링' 앱이 실행 중이 아닙니다.",
+    "no-window": "아이폰 미러링은 열려 있지만 아이폰이 연결되지 않았습니다.",
+    "blocked": ("아이폰 미러링이 연결 대기 화면입니다. 맥에서 직접 연결하세요 "
+                "('사용 중'이라고 나오면 아이폰을 잠그면 미러링이 재개됩니다)."),
 }
 
 
@@ -203,6 +256,7 @@ class PhoneHarnessAdapter:
                            + stdout.decode("utf-8", errors="replace")[-200:])
 
     async def tap(self, x: int, y: int):
+        """스크린샷 이미지 픽셀 기준 좌표. 화면 포인트 변환은 스크립트가 합니다."""
         await self._run("tap", {"PH_X": int(x), "PH_Y": int(y)})
 
     async def swipe(self, x1: int, y1: int, x2: int, y2: int, duration: int = 300):
@@ -211,8 +265,15 @@ class PhoneHarnessAdapter:
                                   "PH_DURATION": int(duration)})
 
     async def type_text(self, text: str):
-        # 안드로이드와 달리 ASCII 제한이 없습니다. 맥이 키 이벤트를 만들어
-        # 넣기 때문에 한글도 그대로 들어갑니다.
+        """맥 키보드 이벤트로 입력합니다.
+
+        안드로이드와 마찬가지로 한글·이모지는 들어가지 않습니다. phone-harness가
+        US 배열 키코드로 한 글자씩 치기 때문에 매핑 없는 문자는 거기서 거절됩니다.
+        기기가 아니라 맥 쪽 제약이라는 것만 다릅니다.
+        """
+        if not str(text).isascii():
+            raise ValueError(
+                "iOS 입력도 ASCII만 됩니다 (phone-harness가 US 배열 키코드로 칩니다)")
         await self._run("type_text", {"PH_TEXT": str(text)})
 
     async def open_app(self, name: str):
@@ -221,31 +282,50 @@ class PhoneHarnessAdapter:
         await self._run("open_app", {"PH_NAME": str(name)})
 
     async def wait_stable(self, timeout: float = 10.0):
-        await self._run("wait_stable", {"PH_TIMEOUT": float(timeout)},
-                        timeout=timeout + CALL_TIMEOUT)
+        result = await self._run("wait_stable", {"PH_TIMEOUT": float(timeout)},
+                                 timeout=timeout + CALL_TIMEOUT)
+        return bool(result.get("stable"))
+
+    async def connection_state(self):
+        """'ready' / 'blocked' / 'no-window' / 'not-running'."""
+        result = await self._run("state")
+        return result.get("state")
 
     async def ocr(self):
-        """Vision OCR 결과를 서버의 element 형식으로 맞춰 돌려줍니다.
+        """Vision OCR 결과를 팜의 element 형식으로 맞춰 돌려줍니다.
 
-        phone-harness는 {text, bounds:[x,y,w,h]} 계열을 돌려주는데, 팜의
-        나머지(안드로이드 uiautomator)는 x1/y1/x2/y2 + center를 씁니다. 두 형식이
-        API 밖으로 새어 나가면 에이전트가 플랫폼별로 다른 코드를 짜야 해서,
-        경계인 여기서 맞춥니다.
+        phone-harness는 `{text, confidence, x, y, w, h}`를 주는데 (x, y)가 이미
+        **중심점**입니다. 팜의 나머지(안드로이드 uiautomator)는 x1/y1/x2/y2 +
+        center를 씁니다. 두 형식이 API 밖으로 새어 나가면 에이전트가 플랫폼마다
+        다른 코드를 짜야 하므로 경계인 여기서 맞춥니다. 좌표는 스크립트가 이미
+        이미지 픽셀로 되돌려 보냈습니다.
         """
         result = await self._run("ocr")
+        img = result.get("img")
+        if img and len(img) == 2:
+            self._size = (int(round(img[0])), int(round(img[1])))
+
         elements = []
         for item in result.get("items", []):
-            rect = _normalize_bounds(item)
-            if not rect:
+            text = str(item.get("text", "")).strip()
+            if not text:
                 continue
+            cx, cy = int(round(item["cx"])), int(round(item["cy"]))
+            half_w, half_h = int(round(item["w"] / 2)), int(round(item["h"] / 2))
             elements.append({
-                "text": str(item.get("text", "")).strip(),
+                "text": text,
                 "content_desc": "",
                 "resource_id": "",
                 "class": "ocr",
-                "clickable": True,   # OCR로 본 글자는 눌러보는 것 말고 할 게 없습니다.
+                # OCR로 본 글자는 눌러보는 것 말고 할 게 없습니다. 뷰 트리가
+                # 아니라서 정말 눌리는지는 알 수 없고, 모른다고 답하느니
+                # 에이전트가 시도할 수 있게 둡니다.
+                "clickable": True,
                 "enabled": True,
-                **rect,
+                "confidence": item.get("confidence"),
+                "bounds": {"x1": cx - half_w, "y1": cy - half_h,
+                           "x2": cx + half_w, "y2": cy + half_h},
+                "center": {"x": cx, "y": cy},
             })
         return elements
 
@@ -282,29 +362,6 @@ class PhoneHarnessAdapter:
         return self._size
 
 
-def _normalize_bounds(item: dict):
-    """phone-harness의 bounds가 어떤 모양으로 오든 x1/y1/x2/y2로 맞춥니다."""
-    raw = item.get("bounds") or item.get("rect") or item.get("box")
-    if isinstance(raw, dict):
-        if all(k in raw for k in ("x1", "y1", "x2", "y2")):
-            x1, y1, x2, y2 = raw["x1"], raw["y1"], raw["x2"], raw["y2"]
-        elif all(k in raw for k in ("x", "y", "width", "height")):
-            x1, y1 = raw["x"], raw["y"]
-            x2, y2 = x1 + raw["width"], y1 + raw["height"]
-        else:
-            return None
-    elif isinstance(raw, (list, tuple)) and len(raw) == 4:
-        # [x, y, w, h] — Vision이 돌려주는 관례.
-        x, y, w, h = raw
-        x1, y1, x2, y2 = x, y, x + w, y + h
-    else:
-        return None
-
-    x1, y1, x2, y2 = (int(round(v)) for v in (x1, y1, x2, y2))
-    return {"bounds": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-            "center": {"x": (x1 + x2) // 2, "y": (y1 + y2) // 2}}
-
-
 def _png_size(data: bytes):
     """PNG 헤더에서 크기만 읽습니다 (Pillow를 부르지 않아도 되는 경로)."""
     import struct
@@ -333,13 +390,55 @@ def _shrink(data: bytes, size=(200, 400)):
 adapter = PhoneHarnessAdapter()
 
 
-def device_entry(lease=None, alias=None):
+# --- 연결 상태 캐시 ---
+# connection_state()는 캡처 + OCR입니다. 대시보드가 2초마다 부르는 기기 목록에
+# 그걸 달면 맥이 계속 OCR을 돌게 됩니다. 그래서 목록은 **마지막으로 알던 값**만
+# 읽고, 실제 확인은 /api/health에서 TTL을 두고 합니다.
+
+STATE_TTL = 30.0
+_state_cache = {"at": 0.0, "value": None}
+
+
+def cached_state():
+    """최근에 확인한 연결 상태. 오래됐거나 확인한 적 없으면 None."""
+    if _state_cache["value"] and (time.time() - _state_cache["at"]) < STATE_TTL:
+        return _state_cache["value"]
+    return None
+
+
+def note_state(value):
+    if value:
+        _state_cache.update({"at": time.time(), "value": value})
+
+
+async def refresh_state(force: bool = False):
+    """연결 상태를 확인하고 캐시합니다. TTL 안이면 확인하지 않습니다."""
+    if not available():
+        return None
+    if not force and cached_state():
+        return cached_state()
+    try:
+        value = await adapter.connection_state()
+    except Exception as e:
+        # 상태를 못 물어보는 것도 상태입니다. 미러링 앱이 죽었을 때가 대개 이쪽.
+        print(f"[{IOS_SERIAL}] connection_state failed: {e}")
+        value = "not-running"
+    note_state(value)
+    return value
+
+
+def device_entry(lease=None, alias=None, state=None):
     """`/api/devices`에 실릴 아이폰 한 줄.
 
     안드로이드 항목과 키를 맞춰 둡니다 — 대시보드가 같은 렌더 경로를 쓰고,
     platform 필드만 보고 다른 버튼을 답니다.
+
+    `state`는 phone-harness의 connection_state()입니다. 'ready'가 아니면
+    안드로이드의 unauthorized·offline과 같은 자리에 이유를 적습니다 — 대시보드에
+    기기가 있는데 아무것도 안 되는 것보다, 왜 안 되는지 보이는 게 낫습니다.
     """
     size = adapter._size or (0, 0)
+    hint = STATE_HINTS.get(state) if state else None
     return {
         "serial": IOS_SERIAL,
         "platform": "ios",
@@ -351,8 +450,8 @@ def device_entry(lease=None, alias=None):
         "sdk": "-",
         "battery": "-",
         "alias": alias or "iPhone (미러링)",
-        "state": "device",
-        "state_hint": None,
+        "state": "device" if hint is None else "disconnected",
+        "state_hint": hint,
         "occupied_by": lease["owner"] if lease else None,
         "occupied_until": lease["expires_at"] if lease else None,
     }

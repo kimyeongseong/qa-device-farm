@@ -47,7 +47,11 @@ class FakeAdapter:
     async def tap(self, x, y): self.calls.append(("tap", x, y))
     async def swipe(self, x1, y1, x2, y2, duration=300):
         self.calls.append(("swipe", x1, y1, x2, y2, duration))
-    async def type_text(self, text): self.calls.append(("type_text", text))
+    async def type_text(self, text):
+        # 진짜 어댑터와 같은 제약: phone-harness가 US 배열 키코드로 칩니다.
+        if not str(text).isascii():
+            raise ValueError("iOS 입력도 ASCII만 됩니다")
+        self.calls.append(("type_text", text))
     async def open_app(self, name): self.calls.append(("open_app", name))
     async def ocr(self):
         self.calls.append(("ocr",))
@@ -57,6 +61,9 @@ class FakeAdapter:
         return b"\x89PNG\r\n\x1a\n" + b"0" * 40
     async def screen_size(self):
         return self._size
+    async def connection_state(self):
+        self.calls.append(("connection_state",))
+        return "ready"
 
 fake = FakeAdapter()
 server.ios.adapter = fake
@@ -140,10 +147,16 @@ check("스와이프 200", r.status_code == 200, r.text)
 check("스와이프가 어댑터로", fake.calls == [("swipe", 1, 2, 3, 4, 250)], str(fake.calls))
 
 fake.calls.clear()
-r = c.post(f"/api/device/{IOS}/input", json={"type": "text", "text": "한글도 됩니다"})
-check("iOS는 한글 입력이 됩니다", r.status_code == 200, r.text)
-check("한글이 그대로 넘어갑니다",
-      fake.calls == [("type_text", "한글도 됩니다")], str(fake.calls))
+r = c.post(f"/api/device/{IOS}/input", json={"type": "text", "text": "hello world"})
+check("텍스트 입력 200", r.status_code == 200, r.text)
+check("문자열이 그대로 넘어갑니다 (안드로이드 같은 셸 인용이 없습니다)",
+      fake.calls == [("type_text", "hello world")], str(fake.calls))
+
+fake.calls.clear()
+r = c.post(f"/api/device/{IOS}/input", json={"type": "text", "text": "한글"})
+check("iOS도 한글은 400", r.status_code == 400, r.text)
+check("400이 이유를 말합니다", "ASCII" in r.json()["message"], r.text)
+check("400이면 미러링 창을 건드리지 않습니다", fake.calls == [], str(fake.calls))
 
 fake.calls.clear()
 r = c.post(f"/api/device/{IOS}/input", json={"type": "key", "keycode": 4})
@@ -258,14 +271,51 @@ else:
     check("맥에서는 phone-harness 유무로 갈립니다",
           isinstance(real_status["available"], bool), str(real_status))
 
-# OCR bounds 형식 변환: phone-harness가 어떤 모양으로 주든 팜 형식으로.
-norm = ios_mirror._normalize_bounds({"bounds": [10, 20, 100, 40]})
-check("[x,y,w,h]를 좌표쌍으로",
-      norm["bounds"] == {"x1": 10, "y1": 20, "x2": 110, "y2": 60}, str(norm))
-check("가운데를 계산합니다", norm["center"] == {"x": 60, "y": 40}, str(norm))
-norm2 = ios_mirror._normalize_bounds({"bounds": {"x": 0, "y": 0, "width": 50, "height": 10}})
-check("dict 형식도 받습니다", norm2["center"] == {"x": 25, "y": 5}, str(norm2))
-check("모르는 형식은 None", ios_mirror._normalize_bounds({"bounds": "이상함"}) is None)
+print()
+print("=== OCR 결과 변환 (phone-harness 실제 형식) ===")
+# phone-harness의 ocr()은 {text, confidence, x, y, w, h}를 주고 (x, y)가 이미
+# **중심점**입니다. 스크립트가 이미지 픽셀로 되돌린 뒤 어댑터가 팜 형식으로
+# 맞춥니다. 여기서는 어댑터의 변환만 확인합니다 (_run을 가로채서).
+real = ios_mirror.PhoneHarnessAdapter()
+
+async def fake_run(verb, env_extra=None, timeout=None):
+    return {"ok": True, "img": [1170, 2532], "items": [
+        {"text": "New Note", "confidence": 0.98,
+         "cx": 100.4, "cy": 200.6, "w": 80.0, "h": 40.0},
+        {"text": "   ", "confidence": 0.4, "cx": 5, "cy": 5, "w": 2, "h": 2},
+    ]}
+real._run = fake_run
+
+import asyncio as _asyncio
+els = _asyncio.run(real.ocr())
+check("요소 하나만 남습니다 (공백 텍스트는 버림)", len(els) == 1, str(els))
+check("중심점을 그대로 씁니다", els[0]["center"] == {"x": 100, "y": 201}, str(els[0]))
+check("w/h로 bounds를 만듭니다",
+      els[0]["bounds"] == {"x1": 60, "y1": 181, "x2": 140, "y2": 221}, str(els[0]))
+check("안드로이드와 같은 키를 갖습니다",
+      all(k in els[0] for k in ("text", "content_desc", "clickable", "center", "bounds")),
+      str(els[0]))
+check("OCR 응답에서 화면 크기를 받아둡니다", real._size == (1170, 2532), str(real._size))
+
+print()
+print("=== 연결 상태 ===")
+check("ready면 사유가 없습니다", ios_mirror.STATE_HINTS["ready"] is None)
+for state in ("not-running", "no-window", "blocked"):
+    check(f"{state}에 한국어 사유가 있습니다", bool(ios_mirror.STATE_HINTS.get(state)))
+
+ios_mirror._state_cache.update({"at": 0.0, "value": None})
+check("확인한 적 없으면 캐시는 비어 있습니다", ios_mirror.cached_state() is None)
+ios_mirror.note_state("blocked")
+check("확인한 값은 캐시에 남습니다", ios_mirror.cached_state() == "blocked")
+
+entry = ios_mirror.device_entry(state="blocked")
+check("연결이 끊겼으면 state가 device가 아닙니다", entry["state"] == "disconnected", str(entry))
+check("끊긴 이유를 목록에 적습니다", "아이폰을 잠그면" in entry["state_hint"], str(entry))
+ready = ios_mirror.device_entry(state="ready")
+check("ready면 평소처럼 device", ready["state"] == "device", str(ready))
+check("ready면 사유가 없습니다", ready["state_hint"] is None, str(ready))
+
+ios_mirror._state_cache.update({"at": 0.0, "value": None})
 
 print()
 print(f"{len(fails)} failed")

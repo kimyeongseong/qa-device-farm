@@ -340,7 +340,7 @@ and only the iOS endpoints answer 503 with the reason. Android is unaffected.
 |---|---|---|
 | Mirroring | ws-scrcpy (H.264) | screenshot polling |
 | Screen reading | uiautomator (view tree) | Vision OCR |
-| Text input | ASCII only (IME needed) | no restriction |
+| Text input | ASCII only (device needs an IME) | ASCII only (Mac types US-layout keycodes) |
 | Key events | keycodes supported | none (use `open_app`) |
 | APK install · logcat · batch | supported | rejected with 400 |
 | Device count | as many as you plug in | one mirror window = one device |
@@ -451,9 +451,10 @@ test_features.py             ok      194 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
 test_cli.py                  ok       27 passed, 0 failed
 test_agent_verbs.py          ok       53 passed, 0 failed
-test_ios_provider.py         ok       74 passed, 0 failed
+test_ios_provider.py         ok       88 passed, 0 failed
+test_ios_scripts.py          ok       43 passed, 0 failed
 test_cli_harness.py          ok       54 passed, 0 failed
-443 passed, 0 failed across 7 suites
+500 passed, 0 failed across 8 suites
 ```
 
 Each suite runs in its own process with a temporary directory as cwd, so one suite's monkeypatching and runtime state (`device_leases.json`, `macros/`) cannot leak into another, and the working tree stays clean.
@@ -467,11 +468,18 @@ skipping), and the harness runner — specifically that a line outside the verb 
 
 **Anything that genuinely needs hardware** is not automated: mirroring quality and latency, audio, real crash detection, the wireless switch. Those were verified by hand on real devices.
 
-**Anything that needs a Mac and an iPhone** is in the same category. The iOS tests replace the
-phone-harness adapter with a fake and verify only the farm's side of the contract (device
-listing, leases, rejections, format conversion). Whether the mirror window is actually clicked,
-and what shape Vision OCR results arrive in, has to be confirmed on a Mac — the script templates
-in `ios_mirror.py` are where that verification lands.
+**Anything that needs a Mac and an iPhone** is covered in two layers.
+
+`test_ios_provider.py` fakes the adapter and checks the farm's side of the contract (device
+listing, leases, rejections, format conversion). `test_ios_scripts.py` goes one layer deeper and
+runs the scripts bound for phone-harness **the way phone-harness itself runs them** (`exec` with
+helpers as globals), against fakes that mirror the real signatures. A mismatched signature or a
+wrong coordinate conversion therefore surfaces without a Mac — this suite is what caught passing
+coordinates to `swipe()` (which takes a direction string; coordinate drags are `drag`) and a
+misreading of the OCR coordinate space.
+
+Still Mac-only: whether the window is really clicked, whether Vision reads the text correctly,
+and whether Accessibility and Screen Recording permissions are in place.
 
 ---
 

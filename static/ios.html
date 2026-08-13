@@ -226,7 +226,8 @@
             const box = document.getElementById('text-input');
             const value = box.value;
             if (!value) return;
-            // 안드로이드와 달리 한글도 그대로 갑니다 — 맥이 키 이벤트를 만듭니다.
+            // 안드로이드와 달리 셸 인용이 필요 없지만, 한글·이모지는 여기서도
+            // 안 됩니다 — phone-harness가 US 배열 키코드로 한 글자씩 칩니다.
             send({ type: 'text', text: value });
             box.value = '';
         }

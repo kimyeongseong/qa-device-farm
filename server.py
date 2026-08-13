@@ -926,9 +926,13 @@ def collect_devices(refresh: bool):
         # phone-harness가 없으면 줄 자체가 없습니다 — 안드로이드만 쓰는 팜에
         # 쓸 수 없는 칸이 하나 더 생기는 게 더 나쁩니다.
         if ios.available():
+            # 연결 상태는 마지막으로 확인해 둔 값만 씁니다. 여기서 직접 물어보면
+            # 대시보드 폴링 2초마다 맥이 캡처와 OCR을 돌게 됩니다 (확인은
+            # /api/health에서 TTL을 두고 합니다).
             devices.append(ios.device_entry(
                 lease=get_lease(ios.IOS_SERIAL),
-                alias=device_aliases.get(ios.IOS_SERIAL)))
+                alias=device_aliases.get(ios.IOS_SERIAL),
+                state=ios.cached_state()))
 
         return {"devices": devices}
     except Exception as e:
@@ -1648,7 +1652,15 @@ def adb_server_info():
 @app.get("/api/health")
 async def health():
     """Liveness probe: is the server up, and can it still talk to adb?"""
-    return await asyncio.to_thread(check_health)
+    # 아이폰 연결 상태는 여기서만 실제로 확인합니다 (TTL이 걸려 있어 모니터링이
+    # 자주 불러도 맥이 매번 OCR을 돌지는 않습니다). 기기 목록은 이 결과를
+    # 재사용합니다.
+    ios_state = await ios.refresh_state()
+    result = await asyncio.to_thread(check_health)
+    if isinstance(result, dict) and ios_state:
+        result["ios"] = {**result["ios"], "connection": ios_state,
+                         "connection_hint": ios.STATE_HINTS.get(ios_state)}
+    return result
 
 def check_health():
     try:

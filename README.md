@@ -349,7 +349,7 @@ python cli.py health   # ios.available 과 ios.reason 을 확인
 |---|---|---|
 | 미러링 | ws-scrcpy (H.264) | 스크린샷 폴링 |
 | 화면 읽기 | uiautomator (뷰 트리) | Vision OCR |
-| 텍스트 입력 | ASCII만 (IME 필요) | 제한 없음 |
+| 텍스트 입력 | ASCII만 (기기에 IME 필요) | ASCII만 (맥이 US 배열 키코드로 침) |
 | 키 입력 | keycode 지원 | 없음 (`open_app` 사용) |
 | APK 설치 · logcat · 배치 | 지원 | 없음 (400으로 거절) |
 | 대수 | 꽂은 만큼 | 미러링 창 하나 = 한 대 |
@@ -460,9 +460,10 @@ test_features.py             ok      194 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
 test_cli.py                  ok       27 passed, 0 failed
 test_agent_verbs.py          ok       53 passed, 0 failed
-test_ios_provider.py         ok       74 passed, 0 failed
+test_ios_provider.py         ok       88 passed, 0 failed
+test_ios_scripts.py          ok       43 passed, 0 failed
 test_cli_harness.py          ok       54 passed, 0 failed
-443 passed, 0 failed across 7 suites
+500 passed, 0 failed across 8 suites
 ```
 
 각 스위트는 별도 프로세스에서 임시 디렉터리를 cwd로 잡고 돌기 때문에, 서로의 monkeypatch나
@@ -481,10 +482,17 @@ harness 스크립트 러너(동사 표 밖의 줄은 한 줄도 실행되지 않
 **기기가 있어야만 되는 것**은 자동화하지 않았습니다: 미러링 화질·지연, 오디오, 실제 크래시 감지,
 무선 전환. 이건 실기기로 수동 확인했습니다.
 
-**맥과 아이폰이 있어야 되는 것**도 마찬가지입니다. iOS 테스트는 phone-harness 어댑터를 가짜로
-바꿔 팜 쪽 계약(기기 목록·점유·거절·형식 변환)만 검증합니다. 미러링 창을 실제로 누르는지,
-Vision OCR 결과가 어떤 모양으로 오는지는 맥에서 확인해야 합니다 — `ios_mirror.py`의 스크립트
-템플릿이 그 검증 지점입니다.
+**맥과 아이폰이 있어야 되는 것**은 두 겹으로 나눠 두었습니다.
+
+`test_ios_provider.py`는 어댑터를 가짜로 바꿔 팜 쪽 계약(기기 목록·점유·거절·형식 변환)을
+봅니다. `test_ios_scripts.py`는 한 겹 더 내려가서, phone-harness에 보낼 스크립트를
+**그쪽이 실행하는 방식 그대로**(`exec` + helpers 전역) 돌립니다. helpers만 실제 시그니처를
+흉내낸 가짜입니다. 그래서 함수 시그니처가 어긋나거나 좌표 변환이 틀리면 맥 없이도 여기서
+드러납니다 — 실제로 `swipe()`에 좌표를 넘기던 것(그쪽 `swipe`는 방향 문자열을 받고 좌표
+드래그는 `drag`입니다)과 OCR 좌표계 오해를 이 테스트가 잡았습니다.
+
+여전히 맥에서만 확인되는 것: 창이 실제로 눌리는지, Vision이 글자를 제대로 읽는지, 손쉬운
+사용·화면 기록 권한이 붙어 있는지.
 
 ---
 
