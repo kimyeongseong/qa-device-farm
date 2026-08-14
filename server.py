@@ -82,7 +82,7 @@ def app_data(name: str) -> str:
 app = FastAPI(
     title="QA Device Farm",
     description="Self-hosted Android device farm: shared real devices over one HTTP/WebSocket API.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 # --- Alias Storage ---
