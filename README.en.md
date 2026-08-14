@@ -48,7 +48,35 @@ Browser (dashboard)          CLI / CI pipeline
 
 ---
 
-## Getting started
+## Prebuilt download
+
+To run it without a checkout, grab the zip for your OS from
+[the build workflow](https://github.com/kimyeongseong/qa-device-farm/actions/workflows/build.yml).
+Python and Node are inside, so nothing else needs installing.
+
+| File | For |
+|---|---|
+| `qa-device-farm-macos-arm64.zip` | Apple Silicon Macs (M1 and later) |
+| `qa-device-farm-macos-x64.zip` | Intel Macs |
+| `qa-device-farm-windows-x64.zip` | Windows 64-bit |
+
+Unzip, run `시작하기.command` (macOS) or `시작하기.bat` (Windows), then open
+http://localhost:8001/.
+
+**adb is not included** — the Android SDK terms do not allow redistributing it.
+Get [platform-tools](https://developer.android.com/tools/releases/platform-tools)
+and drop `adb` into the bundle's `scrcpy_bin/`, or put it on PATH; one already on
+PATH is used as-is. For audio, add a scrcpy 2.7+ binary to the same folder.
+
+**First launch on macOS** shows a warning, because the build is unsigned. Right-click
+`시작하기.command` → Open once, or run `xattr -dr com.apple.quarantine <folder>`.
+
+To build it yourself, run `python build/build.py` on that OS — there is no
+cross-compiling, so macOS builds come from a Mac and Windows builds from Windows.
+
+---
+
+## Running from source
 
 **You need:** Python 3.10+, Node.js 16+, [Android platform-tools](https://developer.android.com/tools/releases/platform-tools), and an Android device with USB debugging on.
 

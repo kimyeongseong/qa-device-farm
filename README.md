@@ -48,7 +48,35 @@ QA 업무 중 실기기가 개인 PC에 묶여 있어서 생기던 문제 — �
 
 ---
 
-## 빠르게 실행하기
+## 받아서 바로 쓰기 (빌드된 배포본)
+
+소스를 받지 않고 압축만 풀어 쓰려면 [Actions의 build 워크플로우](https://github.com/kimyeongseong/qa-device-farm/actions/workflows/build.yml)에서
+자기 OS의 zip을 받으면 됩니다. 파이썬과 Node가 안에 들어 있어서 따로 설치할
+필요가 없습니다.
+
+| 파일 | 대상 |
+|---|---|
+| `qa-device-farm-macos-arm64.zip` | 애플 실리콘 맥 (M1 이후) |
+| `qa-device-farm-macos-x64.zip` | 인텔 맥 |
+| `qa-device-farm-windows-x64.zip` | 윈도우 64비트 |
+
+압축을 풀고 `시작하기.command`(맥) 또는 `시작하기.bat`(윈도우)을 실행한 뒤
+http://localhost:8001/ 을 엽니다.
+
+**adb는 직접 넣어야 합니다.** Android SDK 약관상 재배포할 수 없어서 빠져
+있습니다. [platform-tools](https://developer.android.com/tools/releases/platform-tools)를
+받아 배포본 안의 `scrcpy_bin/`에 넣거나 PATH에 두세요. 이미 PATH에 있으면 그것을
+씁니다. 오디오까지 쓰려면 scrcpy 2.7 이상도 같은 폴더에 넣으면 됩니다.
+
+**맥에서 처음 열 때** 서명하지 않은 빌드라 경고가 뜹니다. `시작하기.command`를
+우클릭 → 열기로 한 번 넘기거나, `xattr -dr com.apple.quarantine <폴더>`를 쓰세요.
+
+직접 빌드하려면 그 OS에서 `python build/build.py`를 돌립니다 — 크로스 컴파일은
+되지 않아서 맥용은 맥에서, 윈도우용은 윈도우에서 만들어야 합니다.
+
+---
+
+## 소스에서 실행하기
 
 **필요한 것:** Python 3.10+, Node.js 16+, [Android platform-tools](https://developer.android.com/tools/releases/platform-tools), USB 디버깅을 켠 안드로이드 기기.
 
