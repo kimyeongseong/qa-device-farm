@@ -7,8 +7,10 @@ name: build
 # 러너에서, 윈도우용은 윈도우 러너에서 각각 빌드합니다.
 
 on:
+  # push와 pull_request를 둘 다 브랜치에 걸면 같은 커밋이 두 번 빌드됩니다.
+  # 브랜치 작업은 PR 쪽이 받고, push는 main과 태그만 봅니다.
   push:
-    branches: [main, 'claude/**']
+    branches: [main]
     tags: ['v*']
   pull_request:
     branches: [main]

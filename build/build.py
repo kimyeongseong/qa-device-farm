@@ -28,6 +28,15 @@ import tarfile
 import urllib.request
 import zipfile
 
+# 이 스크립트는 한국어로 진행 상황을 찍는데, 윈도우 콘솔의 기본 코드페이지는
+# cp1252라서 첫 줄에서 UnicodeEncodeError로 죽습니다(실제로 CI에서 그렇게
+# 실패했습니다). server.py가 같은 이유로 하는 처리를 그대로 합니다.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass  # 리다이렉트되어 재설정할 수 없는 스트림; 그냥 둡니다.
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD_DIR = os.path.join(ROOT, "build")
 OUT_DIR = os.path.join(BUILD_DIR, "out")
