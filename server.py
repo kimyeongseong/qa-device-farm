@@ -33,6 +33,52 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass  # Not a reconfigurable stream (redirected/wrapped); nothing to do.
 
+# --- Where things live ---
+# Run from a checkout, everything is relative to the working directory, and that
+# is what the tests rely on (each suite chdirs into a scratch directory so its
+# leases and macros cannot leak into the next one).
+#
+# Packaged, the two kinds of file have to come apart. The dashboard and the
+# stream config are read-only and ride inside the bundle, which PyInstaller
+# unpacks somewhere temporary -- a path that changes every launch and is wiped
+# on exit. Leases, macros, aliases and logs are the opposite: they have to
+# survive a restart and be findable by whoever is running the farm, so they sit
+# next to the executable.
+#
+# Both helpers return the bare relative name when not frozen, so an unpackaged
+# run behaves exactly as it always has.
+
+FROZEN = getattr(sys, "frozen", False)
+
+# Read-only files shipped with the app.
+BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+
+def _app_home():
+    """Where the farm keeps what it writes, and looks for adb.
+
+    DEVICE_FARM_HOME wins. The packaged launcher sets it to the folder the user
+    actually opened, because the executable itself lives one level down next to
+    its own libraries -- leases and macros buried in there are hard to find and
+    easy to lose on an upgrade.
+    """
+    override = os.environ.get("DEVICE_FARM_HOME", "").strip()
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return os.path.abspath(override)
+    if FROZEN:
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.getcwd()
+
+APP_HOME = _app_home()
+
+def bundled(name: str) -> str:
+    """A file that ships with the app (dashboard, stream config)."""
+    return os.path.join(BUNDLE_DIR, name) if FROZEN else name
+
+def app_data(name: str) -> str:
+    """A file the farm writes and must keep across restarts."""
+    return os.path.join(APP_HOME, name) if FROZEN else name
+
 app = FastAPI(
     title="QA Device Farm",
     description="Self-hosted Android device farm: shared real devices over one HTTP/WebSocket API.",
@@ -40,7 +86,7 @@ app = FastAPI(
 )
 
 # --- Alias Storage ---
-ALIAS_FILE = "device_aliases.json"
+ALIAS_FILE = app_data("device_aliases.json")
 device_aliases = {}
 
 def load_aliases():
@@ -178,25 +224,26 @@ async def require_token(request: Request, call_next):
 
 # Mount Static Files (Frontend)
 # Ensure 'static' directory exists
-if not os.path.exists("static"):
-    os.makedirs("static")
-    
-app.mount("/static", StaticFiles(directory="static"), name="static")
+STATIC_DIR = bundled("static")
+if not os.path.exists(STATIC_DIR):
+    os.makedirs(STATIC_DIR)
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/")
 async def read_root():
-    return FileResponse("static/index.html")
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 @app.get("/control")
 async def control_page():
-    return FileResponse("static/control.html")
+    return FileResponse(os.path.join(STATIC_DIR, "control.html"))
 
 # --- Stream server location ---
 # The dashboard and the stream server (ws-scrcpy) are separate processes on
 # separate ports, so the browser has to be told where the second one is. Both
 # sides read the same file so the port is defined exactly once.
 
-STREAM_CONFIG_FILE = "ws-scrcpy.config.json"
+STREAM_CONFIG_FILE = bundled("ws-scrcpy.config.json")
 FALLBACK_STREAM_PORT = 8010
 
 def get_stream_port() -> int:
@@ -216,6 +263,22 @@ async def get_config():
     """What the dashboard cannot work out from its own URL."""
     return {"stream_port": get_stream_port()}
 
+def bundled_tool(name: str):
+    """A binary the operator dropped into scrcpy_bin/, or None.
+
+    Neither adb nor scrcpy is redistributed here (Android SDK and GPL terms
+    respectively), so scrcpy_bin/ is where a host puts its own copy. Packaged,
+    that directory sits next to the executable -- inside the bundle it would be
+    wiped on every launch, and nobody can drop a file into a path that only
+    exists while the app is running.
+    """
+    exe = f"{name}.exe" if os.name == "nt" else name
+    for base in (APP_HOME, os.path.dirname(os.path.abspath(__file__))):
+        candidate = os.path.join(base, "scrcpy_bin", exe)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
 def get_adb_path():
     """Locate the adb binary.
 
@@ -224,9 +287,8 @@ def get_adb_path():
     uses, so ignoring it made the dashboard look alive while every control
     action failed.
     """
-    exe = "adb.exe" if os.name == "nt" else "adb"
-    local_adb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrcpy_bin", exe)
-    if os.path.exists(local_adb):
+    local_adb = bundled_tool("adb")
+    if local_adb:
         return local_adb
 
     on_path = shutil.which("adb")
@@ -276,7 +338,7 @@ def get_device_lock(serial: str):
 # devices over the WebSocket) and enforced on the HTTP input API used by CI.
 
 DEFAULT_LEASE_SECONDS = 600
-LEASE_FILE = "device_leases.json"
+LEASE_FILE = app_data("device_leases.json")
 
 device_leases = {}  # { serial: {"owner": str, "expires_at": float} }
 
@@ -1701,7 +1763,7 @@ def check_health():
 
 # --- Macro System ---
 
-MACROS_DIR = "macros"
+MACROS_DIR = app_data("macros")
 if not os.path.exists(MACROS_DIR):
     os.makedirs(MACROS_DIR)
 
@@ -2036,7 +2098,7 @@ async def reap_logcat(serial: str, session: dict):
     except Exception as e:
         print(f"[{serial}] Logcat reap: {e}")
 
-LOGCAT_DIR = "logs"
+LOGCAT_DIR = app_data("logs")
 
 class LogcatStartRequest(BaseModel):
     clear: bool = True          # drop whatever is already buffered on the device
@@ -2340,9 +2402,8 @@ async def start_audio(serial: str):
             else:
                 del active_audio_procs[serial] # Cleanup dead process
 
-        exe = "scrcpy.exe" if os.name == "nt" else "scrcpy"
-        scrcpy_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrcpy_bin", exe)
-        if not os.path.exists(scrcpy_bin):
+        scrcpy_bin = bundled_tool("scrcpy")
+        if not scrcpy_bin:
             found = shutil.which("scrcpy")
             if not found:
                 # The binary is not redistributed with this repo, so say where

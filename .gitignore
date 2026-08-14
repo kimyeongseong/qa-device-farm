@@ -11,6 +11,12 @@ node_modules/
 ws-scrcpy/dist/
 ws-scrcpy/build/
 
+# 배포본 빌드 산출물 (build/build.py). 스크립트는 커밋하고 결과물은 빼둡니다.
+build/out/
+build/work/
+build/spec/
+build/cache/
+
 # Local runtime state (device serials, recorded macros, uploads)
 device_aliases.json
 device_leases.json

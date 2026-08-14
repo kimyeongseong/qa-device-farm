@@ -1,0 +1,108 @@
+name: build
+
+# 맥·윈도우 배포본을 만듭니다.
+#
+# 크로스 컴파일이 안 되기 때문에 이 워크플로우가 필요합니다. PyInstaller는 자기가
+# 도는 OS용 실행 파일만 만들고 Node 런타임도 플랫폼별로 다르므로, 맥용은 맥
+# 러너에서, 윈도우용은 윈도우 러너에서 각각 빌드합니다.
+
+on:
+  push:
+    branches: [main, 'claude/**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 태그를 밀면 릴리즈에 올리기 위해
+
+jobs:
+  test:
+    name: 테스트
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 의존성 설치
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      # 기기 없이 도는 스위트입니다. 깨진 걸 빌드해서 넘기지 않으려고 빌드 앞에
+      # 둡니다.
+      - name: 테스트
+        run: python tests/run_all.py
+
+  build:
+    name: 빌드 (${{ matrix.label }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 애플 실리콘과 인텔 맥은 실행 파일이 서로 호환되지 않아 둘 다 만듭니다.
+          - os: macos-14
+            label: macOS (Apple Silicon)
+          - os: macos-13
+            label: macOS (Intel)
+          - os: windows-latest
+            label: Windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ws-scrcpy를 빌드할 때만 씁니다. 배포본에 들어가는 Node는 빌드
+      # 스크립트가 nodejs.org에서 따로 받아 넣습니다(러너 버전에 안 묶이게).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.22.0
+
+      - name: 빌드
+        run: python build/build.py
+
+      - name: 결과물 확인
+        shell: bash
+        run: |
+          set -e
+          cd build/out
+          ls -lh *.zip
+          # 빈 껍데기가 올라가는 걸 막습니다. 파이썬 런타임과 Node가 들어가면
+          # 아무리 작아도 30MB는 넘습니다.
+          size=$(python -c "import os,glob;print(os.path.getsize(glob.glob('*.zip')[0]))")
+          if [ "$size" -lt 30000000 ]; then
+            echo "::error::배포본이 너무 작습니다 ($size bytes) — 뭔가 빠졌습니다"
+            exit 1
+          fi
+
+      # 폴더가 아니라 우리가 만든 zip 하나를 올립니다. actions/upload-artifact는
+      # 올릴 때 자체적으로 다시 압축하면서 실행 권한을 날려버려서, 폴더째 올리면
+      # 받는 사람의 맥에서 시작하기.command와 node가 실행 불가로 도착합니다.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qa-device-farm-${{ matrix.os }}
+          path: build/out/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 릴리즈에 올리기 (태그일 때만)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 세 러너가 동시에 도착하므로 먼저 온 쪽이 릴리즈를 만들고 나머지는
+          # 실패를 무시하고 자기 파일만 올립니다.
+          gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag || true
+          gh release upload "${GITHUB_REF_NAME}" build/out/*.zip --clobber
