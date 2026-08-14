@@ -295,6 +295,20 @@ def get_adb_path():
     if on_path:
         return on_path
 
+    # adbutils ships an adb of its own on some platforms (Windows does, macOS
+    # does not). It is the last thing tried, so a host that pinned its own copy
+    # or put one on PATH still wins -- but a packaged build on a machine with no
+    # platform-tools installed works out of the box instead of failing every
+    # control action. It is also the same binary adbutils talks to, which is one
+    # less way to end up with two adb versions fighting over port 5037.
+    try:
+        from adbutils import adb_path
+        bundled = adb_path()
+        if bundled and os.path.exists(bundled):
+            return bundled
+    except Exception:
+        pass
+
     # Last resort: the default Windows install location. It may well not exist --
     # adb_binary_info() is what says so out loud.
     return "C:\\platform-tools\\adb.exe" if os.name == "nt" else "adb"
