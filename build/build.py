@@ -241,15 +241,30 @@ cd /d "%~dp0"
 :: 스스로 해석하지 않기 때문에, adb가 PATH에 없으면 대시보드와 기기 목록은 멀쩡한데
 :: 미러링만 "spawn adb ENOENT"로 죽습니다.
 ::
-:: 번들에는 adbutils가 들고 온 adb.exe가 들어 있지만 _internal 안이라 PATH에
-:: 안 잡힙니다. scrcpy_bin이 비어 있으면 그걸 한 번 복사해 둡니다.
-if not exist "%~dp0scrcpy_bin\\adb.exe" (
-  if exist "%~dp0{app_name}\\_internal\\adbutils\\binaries\\adb.exe" (
-    echo 번들 adb를 scrcpy_bin으로 복사합니다...
-    copy /y "%~dp0{app_name}\\_internal\\adbutils\\binaries\\adb.exe" "%~dp0scrcpy_bin\\" >nul
-  )
-)
-if exist "%~dp0scrcpy_bin\\adb.exe" set "PATH=%~dp0scrcpy_bin;%PATH%"
+:: 번들에는 adbutils가 들고 온 adb가 들어 있지만 _internal 안이라 PATH에 안
+:: 잡힙니다. scrcpy_bin이 비어 있으면 복사해 둡니다. adb.exe만 옮기면 안 됩니다 --
+:: 윈도우 adb는 AdbWinApi.dll이 같은 폴더에 있어야 하고, 없으면 실행하자마자
+:: 종료 코드 3221225781(0xC0000135, DLL 없음)로 죽습니다.
+set "BUNDLED_ADB=%~dp0{app_name}\\_internal\\adbutils\\binaries"
+if not exist "%~dp0scrcpy_bin" mkdir "%~dp0scrcpy_bin"
+if exist "%~dp0scrcpy_bin\\adb.exe" goto :adb_check_dll
+if not exist "%BUNDLED_ADB%\\adb.exe" goto :adb_done
+echo 번들 adb를 scrcpy_bin으로 복사합니다...
+copy /y "%BUNDLED_ADB%\\adb.exe" "%~dp0scrcpy_bin\\" >nul
+
+:adb_check_dll
+if exist "%~dp0scrcpy_bin\\AdbWinApi.dll" goto :adb_ready
+if not exist "%BUNDLED_ADB%\\AdbWinApi.dll" goto :adb_ready
+copy /y "%BUNDLED_ADB%\\AdbWinApi.dll" "%~dp0scrcpy_bin\\" >nul
+if exist "%BUNDLED_ADB%\\AdbWinUsbApi.dll" copy /y "%BUNDLED_ADB%\\AdbWinUsbApi.dll" "%~dp0scrcpy_bin\\" >nul
+
+:adb_ready
+set "PATH=%~dp0scrcpy_bin;%PATH%"
+
+:adb_done
+:: 이전에 뜬 adb 서버가 살아 있으면 그게 계속 쓰입니다. 방금 올린 adb로 다시
+:: 뜨도록 한 번 내려줍니다.
+adb kill-server >nul 2>&1
 
 :: 스트림 포트는 이 파일 한 곳에서만 정의합니다.
 set "WS_SCRCPY_CONFIG=%~dp0ws-scrcpy.config.json"
@@ -348,12 +363,23 @@ def write_extras(app_dir, tag):
     # 그걸 scrcpy_bin에 복사해 둬야 **ws-scrcpy가** 찾습니다 -- 그쪽은 adb를 PATH에서
     # 찾아 실행하지, 팜처럼 경로를 해석하지 않습니다. 안 하면 대시보드와 기기 목록은
     # 멀쩡한데 미러링만 "spawn adb ENOENT"로 죽습니다. 실제로 그렇게 나갔습니다.
+    # adb.exe 하나만 옮기면 안 됩니다. 윈도우 adb는 AdbWinApi.dll과
+    # AdbWinUsbApi.dll이 같은 폴더에 있어야 하고, 없으면 실행하자마자 종료 코드
+    # 3221225781(0xC0000135, DLL 없음)로 죽습니다. 실제로 그렇게 나갔습니다.
+    # 그래서 파일 하나가 아니라 binaries 폴더의 실행 파일과 DLL을 통째로 옮깁니다.
     try:
         from adbutils import adb_path
         source_adb = adb_path()
         if source_adb and os.path.exists(source_adb):
-            shutil.copy2(source_adb, os.path.join(tools, os.path.basename(source_adb)))
-            log(f"adbutils의 adb를 scrcpy_bin에 넣었습니다: {os.path.basename(source_adb)}")
+            source_dir = os.path.dirname(source_adb)
+            copied = []
+            for entry in sorted(os.listdir(source_dir)):
+                if os.path.splitext(entry)[1].lower() in (".exe", ".dll", "") \
+                        and os.path.isfile(os.path.join(source_dir, entry)) \
+                        and not entry.endswith(".py") and entry != "README.md":
+                    shutil.copy2(os.path.join(source_dir, entry), os.path.join(tools, entry))
+                    copied.append(entry)
+            log(f"adbutils의 adb를 scrcpy_bin에 넣었습니다: {', '.join(copied)}")
     except Exception as e:
         log(f"adbutils adb를 넣지 못했습니다({e}) - 사용자가 직접 넣어야 합니다")
     with open(os.path.join(tools, "여기에-adb를-넣으세요.txt"), "w", encoding="utf-8") as f:
