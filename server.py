@@ -2748,6 +2748,20 @@ if __name__ == "__main__":
 
     ensure_local_adb()
 
+    def hold_window():
+        """배포본이 비정상 종료할 때 창이 닫히기 전에 멈춥니다.
+
+        더블클릭으로 띄운 콘솔 창은 프로세스가 끝나는 순간 사라집니다. 그러면
+        사용자가 보는 것은 "갑자기 꺼졌다"뿐이고, 정작 원인을 적어 둔 줄은 같이
+        사라집니다. 실제로 그렇게 한 번 잃었습니다.
+        """
+        if not FROZEN:
+            return
+        try:
+            input("\n창을 닫으려면 Enter를 누르세요...")
+        except Exception:
+            pass
+
     # 배포한 빌드는 배포자가 원격으로 멈출 수 있어야 합니다. 소스에서 돌릴 때는
     # 검사하지 않습니다 -- 그쪽은 어차피 코드를 들고 있어서 통제할 수도 없고,
     # 개발 중에 네트워크를 요구할 이유도 없습니다.
@@ -2764,10 +2778,7 @@ if __name__ == "__main__":
             print()
             print("  배포자에게 문의하세요.")
             print("=" * 62)
-            try:
-                input("계속하려면 Enter를 누르세요...")
-            except Exception:
-                pass
+            hold_window()
             sys.exit(2)
         CONTROL_STATE.update(state)
 
@@ -2779,6 +2790,7 @@ if __name__ == "__main__":
         print("        Then stop that program, or pick another port:")
         print("          set DEVICE_FARM_PORT=8002   (Windows)")
         print("          export DEVICE_FARM_PORT=8002")
+        hold_window()
         sys.exit(1)
 
     print("=" * 62)
@@ -2821,4 +2833,18 @@ if __name__ == "__main__":
         print("              devices. Set DEVICE_FARM_TOKEN before exposing the farm.")
     print("=" * 62)
 
-    uvicorn.run(app, host=host, port=port)
+    try:
+        uvicorn.run(app, host=host, port=port)
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        # 여기까지 온 예외는 사용자가 볼 수 있어야 합니다. 배포본은 창이 닫히면서
+        # 스택 트레이스까지 같이 사라집니다.
+        import traceback
+        print()
+        print("=" * 62)
+        print("  QA Device Farm이 예기치 않게 종료됐습니다.")
+        print("=" * 62)
+        traceback.print_exc()
+        hold_window()
+        sys.exit(1)
