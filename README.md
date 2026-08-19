@@ -43,10 +43,40 @@ QA 업무 중 실기기가 개인 PC에 묶여 있어서 생기던 문제 — �
 | **오디오 포워딩** | scrcpy 바이너리로 기기 소리를 PC로. |
 | **Picture-in-Picture** | 미러링 화면을 항상 위에 뜨는 작은 창으로. 다른 창에서 작업하면서 기기를 계속 보거나, 여러 대를 동시에 띄워둘 수 있습니다. |
 | **CLI / CI 연동** | 세션 개념 없이 HTTP 호출만으로 기기 점유 → 조작 → 로그 확인 → 반납. |
+| **AI 에이전트 조작** | 좌표 대신 화면에 보이는 글자로 조작합니다 — `tap_text("확인")`. 화면 읽기는 안드로이드가 uiautomator, iOS가 Vision OCR. Claude Code·Codex에 스킬로 등록됩니다. 원격 조작과는 별개 모드입니다. |
+| **iOS 미러링 (macOS 전용)** | 맥에 연결된 아이폰을 팜의 기기 한 대로. 원격 조작과 AI 조작을 따로 제공합니다. 맥이 아니면 이 칸만 사라지고 나머지는 그대로 동작합니다. |
 
 ---
 
-## 빠르게 실행하기
+## 받아서 바로 쓰기 (빌드된 배포본)
+
+소스를 받지 않고 압축만 풀어 쓰려면 [Actions의 build 워크플로우](https://github.com/kimyeongseong/qa-device-farm/actions/workflows/build.yml)에서
+자기 OS의 zip을 받으면 됩니다. 파이썬과 Node가 안에 들어 있어서 따로 설치할
+필요가 없습니다.
+
+| 파일 | 대상 |
+|---|---|
+| `qa-device-farm-macos-arm64.zip` | 애플 실리콘 맥 (M1 이후) |
+| `qa-device-farm-macos-x64.zip` | 인텔 맥 |
+| `qa-device-farm-windows-x64.zip` | 윈도우 64비트 |
+
+압축을 풀고 `시작하기.command`(맥) 또는 `시작하기.bat`(윈도우)을 실행한 뒤
+http://localhost:8001/ 을 엽니다.
+
+**adb는 직접 넣어야 합니다.** Android SDK 약관상 재배포할 수 없어서 빠져
+있습니다. [platform-tools](https://developer.android.com/tools/releases/platform-tools)를
+받아 배포본 안의 `scrcpy_bin/`에 넣거나 PATH에 두세요. 이미 PATH에 있으면 그것을
+씁니다. 오디오까지 쓰려면 scrcpy 2.7 이상도 같은 폴더에 넣으면 됩니다.
+
+**맥에서 처음 열 때** 서명하지 않은 빌드라 경고가 뜹니다. `시작하기.command`를
+우클릭 → 열기로 한 번 넘기거나, `xattr -dr com.apple.quarantine <폴더>`를 쓰세요.
+
+직접 빌드하려면 그 OS에서 `python build/build.py`를 돌립니다 — 크로스 컴파일은
+되지 않아서 맥용은 맥에서, 윈도우용은 윈도우에서 만들어야 합니다.
+
+---
+
+## 소스에서 실행하기
 
 **필요한 것:** Python 3.10+, Node.js 16+, [Android platform-tools](https://developer.android.com/tools/releases/platform-tools), USB 디버깅을 켠 안드로이드 기기.
 
@@ -262,6 +292,102 @@ python cli.py batch-macro --serials R3CN30ABCDE,HA1EJ0000 --name login_flow --co
 
 ---
 
+## AI 에이전트로 조작하기
+
+기존 조작 API는 좌표로 말합니다. 사람이 화면을 보고 누를 때는 그게 맞는데, AI
+에이전트한테는 "탭할 좌표를 먼저 알아내라"가 일의 대부분이 됩니다.
+
+그래서 **에이전트용 동사를 따로 냈습니다.** 원격 조작은 지금까지 하던 그대로 두고,
+그 옆에 별도 모드로 붙는 것입니다.
+
+```bash
+python cli.py harness --serial R3CN30ABCDE --owner ai-agent --occupy --release <<'EOF'
+open_app com.android.settings
+wait_stable
+tap_text "네트워크 및 인터넷"
+wait_stable
+elements
+EOF
+```
+
+| 동사 | 하는 일 |
+|---|---|
+| `elements` | 화면에 보이는 글자와 그것을 누를 좌표 |
+| `tap_text <글자> [n]` | 그 글자가 있는 것을 누름 (같은 글자가 여러 개면 n번째) |
+| `type_text <문자열>` | 텍스트 입력 |
+| `open_app <패키지\|앱이름>` | 앱 실행 |
+| `wait_stable [초]` | 화면이 멈출 때까지 대기 |
+| `screenshot [파일]` | 원본 해상도 PNG |
+| `tap` / `swipe` / `key` / `sleep` | 좌표 조작과 대기 |
+
+**화면을 읽는 방식은 플랫폼마다 다릅니다.** 안드로이드는 `uiautomator dump`로 기기의
+뷰 트리를 그대로 읽습니다 — OCR이 아니라서 인식 오류가 없고 의존성도 늘지 않습니다.
+대신 WebView 내부, 게임 화면, `FLAG_SECURE`가 걸린 화면(금융 앱 등)은 보이지
+않습니다. 그럴 때는 `screenshot`으로 그림을 보고 좌표로 누르면 됩니다. iOS는 macOS
+Vision OCR(phone-harness)을 씁니다.
+
+### 스킬로 등록하기
+
+에이전트가 알아서 쓰게 하려면 SKILL.md를 만들어 두면 됩니다.
+
+```bash
+python cli.py skill --target claude   # ~/.claude/skills/qa-device-farm/SKILL.md
+python cli.py skill --target codex    # ~/.codex/skills/qa-device-farm/SKILL.md
+python cli.py skill --base http://farm.내부주소:8001 --target claude
+```
+
+`--base`로 준 주소가 문서에 박히므로, 팜이 다른 호스트에 있으면 같이 넘기세요.
+
+### 스크립트는 실행되지 않고 해석됩니다
+
+`harness`는 파이썬을 `exec`하지 않습니다. 위의 동사 표에 있는 것만 HTTP 호출로
+바꾸고, 표에 없는 줄은 **한 줄도 실행하기 전에** 거절합니다(종료 코드 2). 이
+스크립트는 대개 LLM이 쓰고 팜은 실기기 여러 대에 물려 있어서, 임의 코드 실행 경로를
+열어둘 이유가 없습니다.
+
+---
+
+## iOS 미러링 (macOS 전용)
+
+맥에 연결된 아이폰을 팜의 기기 한 대(`ios-mirror`)로 같이 다룹니다. 안드로이드와
+마찬가지로 **원격 조작과 AI 조작이 따로** 있습니다.
+
+- **원격 조작** — 대시보드에서 `📱 원격 조작`. 화면을 보면서 클릭(탭)·드래그(스와이프)·
+  텍스트 입력을 합니다. ws-scrcpy 대신 스크린샷 폴링으로 그립니다.
+- **AI 조작** — 안드로이드와 **같은 동사, 같은 엔드포인트**를 씁니다.
+  `python cli.py harness --serial ios-mirror ...`
+
+**필요한 것:**
+
+1. macOS Sequoia 이상, '아이폰 미러링'으로 아이폰과 페어링 완료
+2. [phone-harness](https://github.com/ShawnPana/phone-harness) 설치
+   (`~/.phone-harness` 권장, `phone-harness`가 PATH에 있으면 됩니다)
+3. 터미널에 손쉬운 사용 + 화면 기록 권한
+
+```bash
+python cli.py health   # ios.available 과 ios.reason 을 확인
+```
+
+맥이 아니거나 phone-harness가 없으면 **아이폰 칸이 아예 나타나지 않고**, iOS
+엔드포인트만 503으로 이유를 답합니다. 안드로이드 기능은 그대로 돕니다.
+
+**안드로이드와 다른 점:**
+
+| | 안드로이드 | iOS |
+|---|---|---|
+| 미러링 | ws-scrcpy (H.264) | 스크린샷 폴링 |
+| 화면 읽기 | uiautomator (뷰 트리) | Vision OCR |
+| 텍스트 입력 | ASCII만 (기기에 IME 필요) | ASCII만 (맥이 US 배열 키코드로 침) |
+| 키 입력 | keycode 지원 | 없음 (`open_app` 사용) |
+| APK 설치 · logcat · 배치 | 지원 | 없음 (400으로 거절) |
+| 대수 | 꽂은 만큼 | 미러링 창 하나 = 한 대 |
+
+`/api/devices/occupy`("아무거나 하나")는 **아이폰을 주지 않습니다.** 파이프라인이
+안드로이드를 기대하고 부르는 자리이고, 아이폰은 맥 GUI에 묶인 한 대뿐입니다.
+쓰려면 `--serial ios-mirror`로 명시해서 잡으세요.
+
+---
+
 ## API
 
 `http://localhost:8001/docs`에 전체 스펙이 자동 생성됩니다. 자주 쓰는 것만:
@@ -302,8 +428,16 @@ python cli.py batch-macro --serials R3CN30ABCDE,HA1EJ0000 --name login_flow --co
 | `POST` | `/api/batch/app` | 여러 기기에 앱 제어 |
 | `POST` | `/api/batch/macro` | 여러 기기에 매크로 재생 |
 | `POST` | `/api/batch/install` | 여러 기기에 APK 설치 |
-| `WS` | `/ws/video/{serial}` | screenrecord H.264 스트림 |
-| `WS` | `/ws/control/{serial}` | 실시간 입력 채널 |
+| `WS` | `/ws/video/{serial}` | screenrecord H.264 스트림 (안드로이드 전용) |
+| `WS` | `/ws/control/{serial}` | 실시간 입력 채널 (iOS도 같은 경로) |
+| `GET` | `/api/agent/{serial}/elements` | 화면의 글자와 좌표 (안드로이드 uiautomator / iOS OCR) |
+| `POST` | `/api/agent/{serial}/tap-text` | 글자로 찾아 누르기 (`text`, `index`, `exact`) |
+| `POST` | `/api/agent/{serial}/type-text` | 텍스트 입력 |
+| `POST` | `/api/agent/{serial}/open-app` | 앱 실행 (안드로이드 `package` / iOS `name`) |
+| `POST` | `/api/agent/{serial}/wait-stable` | 화면이 멈출 때까지 대기 (`timeout`, `interval`) |
+
+`/api/device/{serial}/screenshot`은 기본이 썸네일이고, `?full=1`이면 원본 해상도
+PNG입니다. 에이전트가 좌표를 계산할 때 필요합니다.
 
 점유 예시:
 
@@ -352,8 +486,12 @@ python tests/run_all.py
 test_leases_and_input.py     ok       26 passed, 0 failed
 test_features.py             ok      194 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
-test_cli.py                  ok       24 passed, 0 failed
-259 passed, 0 failed across 4 suites
+test_cli.py                  ok       27 passed, 0 failed
+test_agent_verbs.py          ok       53 passed, 0 failed
+test_ios_provider.py         ok       88 passed, 0 failed
+test_ios_scripts.py          ok       43 passed, 0 failed
+test_cli_harness.py          ok       54 passed, 0 failed
+500 passed, 0 failed across 8 suites
 ```
 
 각 스위트는 별도 프로세스에서 임시 디렉터리를 cwd로 잡고 돌기 때문에, 서로의 monkeypatch나
@@ -362,13 +500,27 @@ test_cli.py                  ok       24 passed, 0 failed
 무엇을 덮는지: 점유 충돌·TTL 만료·풀 고갈, 입력 인젝션 차단, 매크로 해상도 스케일링과 v1 호환,
 경로 탈출 차단, 앱 제어 argv, 크래시 패턴 매칭, logcat 죽은 세션 복구와 파일 저장, 배치 부분 실패 격리,
 무선 시리얼 4종, 기기 정보 캐시, lease 영속화, 접근 토큰 경계, 잔존 스트림 프로세스 선별 종료,
-CLI 전 서브커맨드.
+CLI 전 서브커맨드. 여기에 AI 조작(uiautomator 덤프 파싱, `tap_text` 매칭 규칙, 기기 셸 인용,
+`wait_stable` 수렴), iOS 프로바이더(가용/미가용 양쪽, 안드로이드 전용 기능 거절, 배치 skip),
+harness 스크립트 러너(동사 표 밖의 줄은 한 줄도 실행되지 않는지)까지 덮습니다.
 
 `cli.py`는 실제 서브프로세스로 띄워 검증합니다 — 인프로세스 테스트로는 못 잡는 인자 처리 버그가
 실제로 있었기 때문입니다.
 
 **기기가 있어야만 되는 것**은 자동화하지 않았습니다: 미러링 화질·지연, 오디오, 실제 크래시 감지,
 무선 전환. 이건 실기기로 수동 확인했습니다.
+
+**맥과 아이폰이 있어야 되는 것**은 두 겹으로 나눠 두었습니다.
+
+`test_ios_provider.py`는 어댑터를 가짜로 바꿔 팜 쪽 계약(기기 목록·점유·거절·형식 변환)을
+봅니다. `test_ios_scripts.py`는 한 겹 더 내려가서, phone-harness에 보낼 스크립트를
+**그쪽이 실행하는 방식 그대로**(`exec` + helpers 전역) 돌립니다. helpers만 실제 시그니처를
+흉내낸 가짜입니다. 그래서 함수 시그니처가 어긋나거나 좌표 변환이 틀리면 맥 없이도 여기서
+드러납니다 — 실제로 `swipe()`에 좌표를 넘기던 것(그쪽 `swipe`는 방향 문자열을 받고 좌표
+드래그는 `drag`입니다)과 OCR 좌표계 오해를 이 테스트가 잡았습니다.
+
+여전히 맥에서만 확인되는 것: 창이 실제로 눌리는지, Vision이 글자를 제대로 읽는지, 손쉬운
+사용·화면 기록 권한이 붙어 있는지.
 
 ---
 
@@ -392,7 +544,15 @@ CLI 전 서브커맨드.
 
 ## 알려진 한계
 
-- **안드로이드 전용입니다.** iOS는 지원하지 않습니다.
+- **iOS는 맥에서만, 한 대만 됩니다.** macOS의 '아이폰 미러링' 창을 phone-harness로
+  조작하는 방식이라, 팜 서버가 맥에서 돌아야 하고 미러링 창이 열려 있어야 합니다.
+  창 하나 = 기기 한 대이고, 맥 앞에 사람이 앉아 다른 창을 띄우면 조작이 어긋납니다.
+  APK 설치·logcat·배치 작업은 iOS에 없습니다. 안드로이드처럼 USB로 여러 대를 꽂아
+  쓰는 구조가 아닙니다.
+- **에이전트가 화면을 못 읽는 구간이 있습니다.** 안드로이드의 `elements`는
+  uiautomator라서 WebView 내부·게임 화면·`FLAG_SECURE` 화면이 비어 보입니다.
+  화면 전환 애니메이션 중에도 덤프가 실패합니다(그때는 `wait_stable` 후 재시도).
+  이 경우 스크린샷과 좌표로 내려가야 합니다.
 - **인증은 선택입니다.** `DEVICE_FARM_TOKEN`을 설정하지 않으면 접근 가능한 누구나 기기를 조작하고 APK를 설치할 수 있습니다. 사내망 전용이면 그대로도 되지만, 밖으로 노출한다면 반드시 켜세요. 공유 비밀 하나이지 사용자별 계정이 아닙니다.
 - **한글·이모지 입력이 안 됩니다.** `adb shell input text`가 ASCII만 받습니다. 기기에 별도 IME를 붙여야 합니다.
 - **매크로는 여전히 좌표 기반입니다.** 해상도 차이는 비례 스케일링으로 보정하지만, 화면비가 다르거나 레이아웃 자체가 바뀌는 기기(폴더블, 태블릿)에서는 어긋납니다. UI 요소를 찾아 누르는 방식이 아닙니다. 녹화 전에 저장된 v1 매크로는 해상도 정보가 없어 스케일 없이 재생됩니다.

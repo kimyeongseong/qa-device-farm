@@ -11,7 +11,13 @@ import shutil
 import time
 import re
 import hmac
+import contextlib
 from pydantic import BaseModel
+
+# iOS 미러링은 맥 + phone-harness가 있을 때만 켜집니다. 임포트 자체는 어디서든
+# 되고(플랫폼 검사는 호출 시점), 없으면 iOS 경로만 503으로 막힙니다.
+import ios_mirror as ios
+import dist_control
 
 # This server echoes device output — logcat lines, app names, adb errors — and
 # those routinely carry characters the console codepage cannot encode (emoji on
@@ -29,14 +35,81 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass  # Not a reconfigurable stream (redirected/wrapped); nothing to do.
 
+# --- Where things live ---
+# Run from a checkout, everything is relative to the working directory, and that
+# is what the tests rely on (each suite chdirs into a scratch directory so its
+# leases and macros cannot leak into the next one).
+#
+# Packaged, the two kinds of file have to come apart. The dashboard and the
+# stream config are read-only and ride inside the bundle, which PyInstaller
+# unpacks somewhere temporary -- a path that changes every launch and is wiped
+# on exit. Leases, macros, aliases and logs are the opposite: they have to
+# survive a restart and be findable by whoever is running the farm, so they sit
+# next to the executable.
+#
+# Both helpers return the bare relative name when not frozen, so an unpackaged
+# run behaves exactly as it always has.
+
+FROZEN = getattr(sys, "frozen", False)
+
+# Read-only files shipped with the app.
+BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+
+def _app_home():
+    """Where the farm keeps what it writes, and looks for adb.
+
+    DEVICE_FARM_HOME wins. The packaged launcher sets it to the folder the user
+    actually opened, because the executable itself lives one level down next to
+    its own libraries -- leases and macros buried in there are hard to find and
+    easy to lose on an upgrade.
+    """
+    override = os.environ.get("DEVICE_FARM_HOME", "").strip()
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return os.path.abspath(override)
+    if FROZEN:
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.getcwd()
+
+APP_HOME = _app_home()
+
+def bundled(name: str) -> str:
+    """A file that ships with the app (dashboard, stream config)."""
+    return os.path.join(BUNDLE_DIR, name) if FROZEN else name
+
+def app_data(name: str) -> str:
+    """A file the farm writes and must keep across restarts."""
+    return os.path.join(APP_HOME, name) if FROZEN else name
+
+# 배포본 원격 차단 상태. 기동할 때 채워지고, 켜 둔 채로도 주기적으로 다시
+# 확인합니다 -- 팜은 며칠씩 켜 두는 물건이라 기동 때 한 번만 보면 차단이 한참 뒤에나
+# 먹습니다.
+CONTROL_STATE = {}
+
+# 통짜 EXE 배포본이 직접 띄운 미러링 서버. 종료할 때 같이 내리려고 들고 있습니다.
+bundled_stream_procs = []
+
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    """기동·종료 때 할 일.
+
+    on_event 대신 이걸 씁니다. 지원 중단 경고가 배포본 첫 화면에 세 덩어리
+    찍히는데, QA 담당자가 그걸 보면 고장으로 읽습니다.
+    """
+    await start_bundled_stream_server()
+    await start_control_recheck()
+    yield
+    await stop_bundled_stream_server()
+
 app = FastAPI(
+    lifespan=lifespan,
     title="QA Device Farm",
     description="Self-hosted Android device farm: shared real devices over one HTTP/WebSocket API.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 # --- Alias Storage ---
-ALIAS_FILE = "device_aliases.json"
+ALIAS_FILE = app_data("device_aliases.json")
 device_aliases = {}
 
 def load_aliases():
@@ -100,6 +173,63 @@ def token_ok(request: Request) -> bool:
     # timing the response.
     return hmac.compare_digest(supplied, FARM_TOKEN)
 
+# --- 안드로이드 전용 경로 ---
+# 아이폰은 팜 안에서 기기처럼 보이지만 adb가 없습니다. APK 설치나 logcat을
+# 아이폰 시리얼로 부르면 adb가 "device not found"를 뱉는데, 그 메시지로는
+# 무엇이 잘못됐는지 알 수 없습니다. 엔드포인트 열다섯 곳에 같은 검사를 복사하는
+# 대신 경로 한 곳에서 막고 이유를 말합니다.
+ANDROID_ONLY_PREFIXES = {
+    "/api/install/": "APK 설치",
+    "/api/uninstall/": "패키지 삭제",
+    "/api/packages/": "패키지 목록",
+    "/api/info/": "기기 상세 정보",
+    "/api/wireless/": "무선 디버깅",
+    "/api/usb/": "USB 전환",
+    "/api/app/": "앱 제어",
+    "/api/logcat/": "logcat 수집",
+    "/api/audio/": "오디오 포워딩",
+    "/api/macros/": "매크로",
+}
+
+def topic_particle(word: str) -> str:
+    """'은' 또는 '는'. 한글 받침 유무로 갈립니다.
+
+    기능 이름을 메시지에 끼워 넣는 자리가 여기뿐이라 '은(는)'으로 때울 수도
+    있지만, 이 팜의 다른 오류 메시지는 전부 사람이 쓴 문장입니다. 하나만
+    기계처럼 보이면 그게 눈에 띕니다.
+    """
+    if not word:
+        return "는"
+    last = word.rstrip()[-1]
+    if "가" <= last <= "힣":
+        return "은" if (ord(last) - 0xAC00) % 28 else "는"
+    return "은(는)"  # 숫자나 영문으로 끝나면 읽는 법이 갈립니다.
+
+def android_only_feature(path: str):
+    """이 경로가 아이폰 시리얼을 받았고 안드로이드 전용이면 그 기능 이름."""
+    if ios.IOS_SERIAL not in path.split("/"):
+        return None
+    if path.endswith("/reset-stream"):
+        return "스트림 정리"
+    for prefix, label in ANDROID_ONLY_PREFIXES.items():
+        if path.startswith(prefix):
+            return label
+    return None
+
+@app.middleware("http")
+async def block_ios_on_android_paths(request: Request, call_next):
+    feature = android_only_feature(request.url.path)
+    if feature:
+        return JSONResponse(
+            {"status": "error",
+             "message": f"{feature}{topic_particle(feature)} 안드로이드 전용입니다 "
+                        f"(iOS 미러링 기기에서는 쓸 수 없습니다)"},
+            status_code=400)
+    return await call_next(request)
+
+# 토큰 검사는 이 아래에 둡니다. Starlette은 나중에 등록된 미들웨어를 바깥에
+# 두므로, 인증이 먼저 걸리고 그 다음에 위 경로 검사가 돕니다 — 토큰 없이
+# 부른 요청이 400으로 먼저 튕겨 나가지 않게.
 @app.middleware("http")
 async def require_token(request: Request, call_next):
     if not FARM_TOKEN or request.method == "OPTIONS":
@@ -117,25 +247,156 @@ async def require_token(request: Request, call_next):
 
 # Mount Static Files (Frontend)
 # Ensure 'static' directory exists
-if not os.path.exists("static"):
-    os.makedirs("static")
-    
-app.mount("/static", StaticFiles(directory="static"), name="static")
+STATIC_DIR = bundled("static")
+if not os.path.exists(STATIC_DIR):
+    os.makedirs(STATIC_DIR)
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+async def start_bundled_stream_server():
+    """통짜 EXE로 배포했을 때 미러링 서버를 서버가 직접 띄웁니다.
+
+    소스로 돌 때는 사람이 `npm start`로 따로 띄웁니다(그게 개발할 때 편합니다).
+    배포본은 그럴 수 없습니다 -- 받는 사람이 실행하는 건 EXE 하나뿐이고, 배치
+    파일로 두 프로세스를 띄우게 하면 거기서부터 "왜 창이 두 개냐"가 시작됩니다.
+
+    Node와 ws-scrcpy는 EXE 안에 들어 있고, PyInstaller가 풀어 놓은 자리에서
+    그대로 실행합니다. adb는 그 전에 PATH에 올려 둬야 합니다 -- ws-scrcpy는
+    adb를 PATH에서 찾아 띄우기 때문입니다.
+    """
+    if not FROZEN:
+        return
+
+    entry = os.path.join(BUNDLE_DIR, "ws-scrcpy", "index.js")
+    if not os.path.exists(entry):
+        return  # 미러링 서버를 빼고 만든 배포본. 간이 미러링은 그대로 됩니다.
+
+    node = os.path.join(BUNDLE_DIR, "node", "node.exe" if os.name == "nt" else "node")
+    if not os.path.exists(node):
+        # Node를 빼고 만든(작은) 배포본이거나 꺼내기에 실패한 경우. PC에 설치된
+        # Node가 있으면 그걸로 돌립니다 -- 고화질 미러링을 포기할 이유는 없습니다.
+        node = shutil.which("node")
+        if not node:
+            print("[stream] Node를 찾지 못해 고화질 미러링을 건너뜁니다.")
+            print("[stream] 간이 미러링은 그대로 쓸 수 있습니다.")
+            return
+
+    if os.name != "nt" and node.startswith(BUNDLE_DIR):
+        try:
+            os.chmod(node, 0o755)   # zip을 거치면 실행 권한이 날아갑니다.
+        except OSError:
+            pass
+
+    env = dict(os.environ)
+    env["WS_SCRCPY_CONFIG"] = STREAM_CONFIG_FILE
+    adb_dir = os.path.dirname(os.path.abspath(get_adb_path()))
+    if os.path.isdir(adb_dir):
+        env["PATH"] = adb_dir + os.pathsep + env.get("PATH", "")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            node, entry, env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
+    except Exception as e:
+        print(f"[stream] 미러링 서버를 띄우지 못했습니다: {e}")
+        print("[stream] 간이 미러링은 그대로 쓸 수 있습니다.")
+        return
+
+    bundled_stream_procs.append(proc)
+    print(f"[stream] 미러링 서버 시작 (포트 {get_stream_port()})", flush=True)
+
+    async def watch():
+        _, stderr = await proc.communicate()
+        if proc.returncode not in (0, None):
+            detail = stderr.decode("utf-8", errors="replace").strip()[-400:]
+            print(f"[stream] 미러링 서버가 종료됐습니다 (코드 {proc.returncode})")
+            if detail:
+                print(f"[stream] {detail}", flush=True)
+
+    asyncio.create_task(watch())
+
+async def stop_bundled_stream_server():
+    """팜을 닫으면 미러링 서버도 같이 내려가야 합니다. 남으면 포트를 쥡니다."""
+    for proc in bundled_stream_procs:
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+async def start_control_recheck():
+    """배포본이면 켜 둔 채로도 주기적으로 사용 가능 여부를 다시 확인합니다.
+
+    팜은 며칠씩 켜 두는 물건이라, 기동할 때 한 번만 보면 차단이 재부팅 전까지
+    먹지 않습니다. 차단으로 바뀌면 조작을 막고 콘솔에 사유를 찍습니다.
+    """
+    if not CONTROL_STATE:
+        return
+
+    async def loop():
+        while True:
+            await asyncio.sleep(dist_control.RECHECK_SECONDS)
+            state = await asyncio.to_thread(dist_control.evaluate, APP_HOME)
+            CONTROL_STATE.update(state)
+            if not state["allowed"]:
+                print("=" * 62)
+                print("  배포자가 이 프로그램의 사용을 중지했습니다.")
+                print(f"  {state['message']}")
+                print(f"  설치 ID {state['install_id']}")
+                print("=" * 62, flush=True)
+
+    asyncio.create_task(loop())
+
+def control_block_response():
+    """차단된 상태에서 조작 요청이 오면 돌려줄 응답. 허용이면 None."""
+    if CONTROL_STATE and CONTROL_STATE.get("allowed") is False:
+        return JSONResponse(
+            {"status": "error",
+             "message": CONTROL_STATE.get("message") or "사용이 중지되었습니다.",
+             "install_id": CONTROL_STATE.get("install_id")},
+            status_code=403)
+    return None
+
+@app.middleware("http")
+async def block_when_disabled(request: Request, call_next):
+    """차단되면 기기를 건드리는 요청을 막습니다.
+
+    대시보드와 health는 열어 둡니다 -- 사용자가 왜 안 되는지 보고 자기 설치 ID를
+    확인할 수 있어야 배포자에게 문의할 수 있습니다.
+    """
+    path = request.url.path
+    if not is_public_path(path) and path.startswith("/api/"):
+        blocked = control_block_response()
+        if blocked:
+            return blocked
+    return await call_next(request)
 
 @app.get("/")
 async def read_root():
-    return FileResponse("static/index.html")
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 @app.get("/control")
 async def control_page():
-    return FileResponse("static/control.html")
+    return FileResponse(os.path.join(STATIC_DIR, "control.html"))
 
 # --- Stream server location ---
 # The dashboard and the stream server (ws-scrcpy) are separate processes on
 # separate ports, so the browser has to be told where the second one is. Both
 # sides read the same file so the port is defined exactly once.
 
-STREAM_CONFIG_FILE = "ws-scrcpy.config.json"
+def _stream_config_path():
+    """스트림 설정 파일. 실행 파일 옆에 둔 것이 번들 안의 것을 이깁니다.
+
+    통짜 EXE는 설정이 안에 들어가 버려서 포트를 못 바꿉니다. 옆에 같은 이름으로
+    두면 그걸 쓰도록 해서, 8010이 이미 물려 있는 PC에서도 손댈 자리를 남깁니다.
+    """
+    beside = app_data("ws-scrcpy.config.json")
+    if FROZEN and os.path.exists(beside):
+        return beside
+    return bundled("ws-scrcpy.config.json")
+
+STREAM_CONFIG_FILE = _stream_config_path()
 FALLBACK_STREAM_PORT = 8010
 
 def get_stream_port() -> int:
@@ -155,6 +416,67 @@ async def get_config():
     """What the dashboard cannot work out from its own URL."""
     return {"stream_port": get_stream_port()}
 
+def bundled_tool(name: str):
+    """A binary the operator dropped into scrcpy_bin/, or None.
+
+    Neither adb nor scrcpy is redistributed here (Android SDK and GPL terms
+    respectively), so scrcpy_bin/ is where a host puts its own copy. Packaged,
+    that directory sits next to the executable -- inside the bundle it would be
+    wiped on every launch, and nobody can drop a file into a path that only
+    exists while the app is running.
+    """
+    exe = f"{name}.exe" if os.name == "nt" else name
+    for base in (APP_HOME, os.path.dirname(os.path.abspath(__file__))):
+        candidate = os.path.join(base, "scrcpy_bin", exe)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+def ensure_local_adb():
+    """번들 안의 adb를 실행 파일 옆 scrcpy_bin/으로 한 번 꺼내 놓습니다.
+
+    통짜 EXE는 실행할 때마다 임시 폴더에 풀리고 끝나면 지워집니다. 거기 있는
+    adb를 그대로 쓰면 두 가지가 꼬입니다. adb 서버가 그 임시 파일을 잡고 있어서
+    종료할 때 정리가 안 되고, 경로가 매번 바뀌어서 사용자가 "어느 adb를 쓰는지"
+    확인할 수도 없습니다. 고정된 자리로 옮겨 두면 둘 다 없어집니다.
+
+    adb.exe만 옮기면 안 됩니다 -- 윈도우 adb는 AdbWinApi.dll이 같은 폴더에
+    있어야 하고, 없으면 실행하자마자 0xC0000135로 죽습니다.
+    """
+    if not FROZEN:
+        return None
+
+    target_dir = os.path.join(APP_HOME, "scrcpy_bin")
+    exe = "adb.exe" if os.name == "nt" else "adb"
+    target = os.path.join(target_dir, exe)
+    if os.path.exists(target):
+        return target
+
+    try:
+        from adbutils import adb_path
+        source = adb_path()
+    except Exception:
+        return None
+    if not (source and os.path.exists(source)):
+        return None
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        source_dir = os.path.dirname(source)
+        for entry in sorted(os.listdir(source_dir)):
+            full = os.path.join(source_dir, entry)
+            if os.path.isfile(full) and os.path.splitext(entry)[1].lower() in (".exe", ".dll", ""):
+                if entry.endswith(".py") or entry == "README.md":
+                    continue
+                shutil.copy2(full, os.path.join(target_dir, entry))
+        if os.name != "nt" and os.path.exists(target):
+            os.chmod(target, 0o755)
+        print(f"[adb] 번들 adb를 {target_dir} 에 꺼내 두었습니다.")
+        return target if os.path.exists(target) else None
+    except Exception as e:
+        print(f"[adb] 번들 adb를 꺼내지 못했습니다: {e}")
+        return None
+
 def get_adb_path():
     """Locate the adb binary.
 
@@ -163,14 +485,27 @@ def get_adb_path():
     uses, so ignoring it made the dashboard look alive while every control
     action failed.
     """
-    exe = "adb.exe" if os.name == "nt" else "adb"
-    local_adb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrcpy_bin", exe)
-    if os.path.exists(local_adb):
+    local_adb = bundled_tool("adb")
+    if local_adb:
         return local_adb
 
     on_path = shutil.which("adb")
     if on_path:
         return on_path
+
+    # adbutils ships an adb of its own on some platforms (Windows does, macOS
+    # does not). It is the last thing tried, so a host that pinned its own copy
+    # or put one on PATH still wins -- but a packaged build on a machine with no
+    # platform-tools installed works out of the box instead of failing every
+    # control action. It is also the same binary adbutils talks to, which is one
+    # less way to end up with two adb versions fighting over port 5037.
+    try:
+        from adbutils import adb_path
+        bundled = adb_path()
+        if bundled and os.path.exists(bundled):
+            return bundled
+    except Exception:
+        pass
 
     # Last resort: the default Windows install location. It may well not exist --
     # adb_binary_info() is what says so out loud.
@@ -215,7 +550,7 @@ def get_device_lock(serial: str):
 # devices over the WebSocket) and enforced on the HTTP input API used by CI.
 
 DEFAULT_LEASE_SECONDS = 600
-LEASE_FILE = "device_leases.json"
+LEASE_FILE = app_data("device_leases.json")
 
 device_leases = {}  # { serial: {"owner": str, "expires_at": float} }
 
@@ -330,11 +665,54 @@ async def adb_exec(adb_path: str, serial: str, *args: str):
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode(errors="replace").strip() or f"adb exited {proc.returncode}")
 
+async def adb_capture(adb_path: str, serial: str, *args: str) -> str:
+    """adb_exec's sibling for commands whose output is the point.
+
+    Same argv-only rule. adb_exec throws stdout away, which is right for input
+    injection and wrong for anything that reads the device back.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        adb_path, "-s", serial, *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(stderr.decode(errors="replace").strip() or f"adb exited {proc.returncode}")
+    return stdout.decode("utf-8", errors="replace")
+
 def as_int(value, name: str) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         raise ValueError(f"'{name}' must be an integer, got {value!r}")
+
+def android_text_arg(text: str) -> str:
+    """Make one argument for `adb shell input text`.
+
+    Two things bite here, and both were live.
+
+    Passing the string as a single argv entry is not enough: adb concatenates
+    the shell command and the *device* shell splits it again, so "hello world"
+    arrived as `input text hello world` and only "hello" was typed. `input`
+    reads a space as %s, so spaces are encoded rather than passed through.
+
+    The same second split is an injection path -- a text of `a; reboot` ran as
+    two device-shell commands. Wrapping the argument in single quotes (with the
+    usual '\\'' dance for embedded quotes) makes the device shell treat it as one
+    inert word.
+
+    Non-ASCII still cannot be typed this way: `input text` speaks ASCII only and
+    Korean or emoji need an IME on the device. Say so instead of silently
+    dropping characters.
+    """
+    if not text.isascii():
+        raise ValueError("'text' supports ASCII only; install an IME for other scripts")
+    # Control characters have no representation here and would end the command.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        raise ValueError("'text' cannot contain control characters")
+    quoted = text.replace("'", "'\\''")
+    return "'" + quoted.replace(" ", "%s") + "'"
 
 async def dispatch_input(adb_path: str, serial: str, event: dict):
     """Turn one control event into a single `adb shell input` call."""
@@ -356,68 +734,145 @@ async def dispatch_input(adb_path: str, serial: str, event: dict):
         await adb_exec(adb_path, serial, "shell", "input", "keyevent", str(keycode))
 
     elif etype == "text":
-        # `input text` only carries ASCII. Korean and emoji need an IME on the
-        # device; this endpoint does not pretend otherwise.
         text = str(event.get("text", ""))
-        if not text.isascii():
-            raise ValueError("'text' supports ASCII only; install an IME for other scripts")
-        await adb_exec(adb_path, serial, "shell", "input", "text", text)
+        await adb_exec(adb_path, serial, "shell", "input", "text", android_text_arg(text))
 
     else:
         raise ValueError(f"Unknown event type: {etype!r}")
 # -----------------------
 
-@app.get("/api/device/{serial}/screenshot")
-async def get_device_screenshot(serial: str):
+# --- iOS 분기 헬퍼 ---
+# 아이폰은 팜 안에서 기기 한 대처럼 보이지만, 뒤에 adb가 아니라 phone-harness가
+# 있습니다. 기존 핸들러를 갈라 놓는 대신 진입부에서 이쪽으로 넘깁니다 — 점유
+# 검사나 녹화 같은 공통 규칙은 갈라지기 전에 이미 지나갑니다.
+
+def ios_unavailable_response():
+    return JSONResponse({"status": "error", "message": ios.ios_status()["reason"]},
+                        status_code=503)
+
+async def ios_screenshot_response(full: bool):
+    if not ios.available():
+        return JSONResponse({"status": "error", "message": ios.ios_status()["reason"]},
+                            status_code=503)
     try:
+        data = await ios.adapter.screenshot(full=full)
+    except Exception as e:
+        print(f"[{ios.IOS_SERIAL}] Screenshot Error: {e}")
+        return Response(status_code=503)
+    return Response(content=data, media_type="image/png" if full else "image/jpeg")
+
+async def ios_dispatch_ws(serial: str, event: dict):
+    """WebSocket 조작용. HTTP와 달리 응답 객체가 아니라 예외로 실패를 알립니다."""
+    etype = event.get("type")
+    if etype == "tap":
+        await ios.adapter.tap(as_int(event.get("x"), "x"), as_int(event.get("y"), "y"))
+    elif etype == "swipe":
+        await ios.adapter.swipe(
+            as_int(event.get("x1"), "x1"), as_int(event.get("y1"), "y1"),
+            as_int(event.get("x2"), "x2"), as_int(event.get("y2"), "y2"),
+            as_int(event.get("duration", 300), "duration"))
+    elif etype == "text":
+        await ios.adapter.type_text(str(event.get("text", "")))
+    else:
+        raise ValueError(f"iOS에서 지원하지 않는 이벤트입니다: {etype!r}")
+
+async def ios_input(event: dict):
+    """안드로이드 dispatch_input과 같은 이벤트를 아이폰에서 실행합니다."""
+    if not ios.available():
+        return ios_unavailable_response()
+
+    etype = event.get("type")
+    try:
+        if etype == "tap":
+            await ios.adapter.tap(as_int(event.get("x"), "x"), as_int(event.get("y"), "y"))
+        elif etype == "swipe":
+            await ios.adapter.swipe(
+                as_int(event.get("x1"), "x1"), as_int(event.get("y1"), "y1"),
+                as_int(event.get("x2"), "x2"), as_int(event.get("y2"), "y2"),
+                as_int(event.get("duration", 300), "duration"))
+        elif etype == "text":
+            await ios.adapter.type_text(str(event.get("text", "")))
+        elif etype == "key":
+            # 안드로이드 keycode는 아이폰에 대응이 없습니다. 홈/앱 전환은
+            # open_app으로 하세요.
+            return JSONResponse(
+                {"status": "error",
+                 "message": "iOS는 keycode 입력을 지원하지 않습니다 (open-app을 쓰세요)"},
+                status_code=400)
+        else:
+            return JSONResponse({"status": "error", "message": f"Unknown event type: {etype!r}"},
+                                status_code=400)
+    except ValueError as bad:
+        return JSONResponse({"status": "error", "message": str(bad)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+    return {"status": "success"}
+
+def capture_screenshot_bytes(serial: str, full: bool = False, size=None):
+    """One screenshot as encoded bytes. Blocking -- call it in a thread.
+
+    The dashboard polls this at thumbnail size, but an agent reading the screen
+    needs the pixels the device actually has: it maps what it sees back to tap
+    coordinates, and a 300x600 thumbnail of a 1080x2400 phone puts every tap in
+    the wrong place. `full` keeps the native resolution and encodes PNG so text
+    stays readable; `size` is for internal callers that want something smaller
+    still (wait_stable compares frames, it does not need detail).
+    """
+    import io
+
+    d = adb.device(serial=serial)
+
+    # Retry logic for unstable connections
+    img = None
+    for attempt in range(2):
+        try:
+            img = d.screenshot()
+            break
+        except Exception as attempt_msg:
+            print(f"[{serial}] Screenshot attempt {attempt+1} failed: {attempt_msg}")
+            if attempt == 1:
+                # If failure persists, return empty or error image instead of crashing server
+                return None, None
+
+    if not img:
+        return None, None
+
+    buf = io.BytesIO()
+    try:
+        if full:
+            img.save(buf, format="PNG")
+            media = "image/png"
+        else:
+            img.thumbnail(size or (300, 600))
+            img.save(buf, format="JPEG", quality=60)
+            media = "image/jpeg"
+    except Exception as save_err:
+        print(f"[{serial}] Image Save Error: {save_err}")
+        return None, None
+
+    buf.seek(0)
+    return buf.getvalue(), media
+
+@app.get("/api/device/{serial}/screenshot")
+async def get_device_screenshot(serial: str, full: bool = False):
+    """The device screen. `?full=1` for native resolution PNG (agent use)."""
+    try:
+        if ios.is_ios(serial):
+            return await ios_screenshot_response(full)
+
         lock = get_device_lock(serial)
-        
+
         # Acquire lock to ensure only one screenshot per device at a time
         async with lock:
-            loop = asyncio.get_event_loop()
-            
-            def capture_task():
-                import io
-                
-                d = adb.device(serial=serial)
-                
-                # Retry logic for unstable connections
-                img = None
-                for attempt in range(2):
-                    try:
-                        img = d.screenshot()
-                        break
-                    except Exception as attempt_msg:
-                         print(f"[{serial}] Screenshot attempt {attempt+1} failed: {attempt_msg}")
-                         if attempt == 1: 
-                             # If failure persists, return empty or error image instead of crashing server
-                             return None
-                
-                if not img: return None
+            img_bytes, media = await asyncio.to_thread(capture_screenshot_bytes, serial, full)
 
-                # Resize optimization
-                img.thumbnail((300, 600))
-                
-                # Convert to JPEG
-                buf = io.BytesIO()
-                try:
-                    img.save(buf, format="JPEG", quality=60)
-                except Exception as save_err:
-                    print(f"[{serial}] Image Save Error: {save_err}")
-                    return None
-                    
-                buf.seek(0)
-                return buf.getvalue()
-
-            # Run blocking ADB/Image code in thread pool
-            img_bytes = await loop.run_in_executor(None, capture_task)
-            
             if img_bytes is None:
                 # Return a placeholder or 503 Service Unavailable (but 200 with error msg might be safer for frontend polling)
                 # Let's return 404 or 503 so frontend knows to retry silently
                 return Response(status_code=503)
-            
-            return Response(content=img_bytes, media_type="image/jpeg")
+
+            return Response(content=img_bytes, media_type=media)
 
     except Exception as e:
         print(f"[{serial}] Screenshot Error: {e}")
@@ -443,6 +898,11 @@ def ws_token_ok(websocket: WebSocket) -> bool:
 async def websocket_video_endpoint(websocket: WebSocket, serial: str):
     if not ws_token_ok(websocket):
         await websocket.close(code=1008, reason="token required")
+        return
+    if ios.is_ios(serial):
+        # 아이폰에는 screenrecord가 없습니다. 원격 화면은 /static/ios.html이
+        # 스크린샷 폴링으로 그립니다.
+        await websocket.close(code=1008, reason="iOS는 스크린샷 폴링으로 봅니다 (/static/ios.html)")
         return
     await websocket.accept()
     print(f"[{serial}] Video WS Connected")
@@ -506,7 +966,10 @@ async def websocket_control_endpoint(websocket: WebSocket, serial: str):
             # -----------------------
 
             try:
-                await dispatch_input(adb_path, serial, event)
+                if ios.is_ios(serial):
+                    await ios_dispatch_ws(serial, event)
+                else:
+                    await dispatch_input(adb_path, serial, event)
             except ValueError as bad_event:
                 # A malformed event should not tear down the whole session.
                 print(f"[{serial}] Ignored event: {bad_event}")
@@ -684,6 +1147,7 @@ def collect_devices(refresh: bool):
 
                 devices.append({
                     "serial": d.serial,
+                    "platform": "android",
                     "model": model,
                     "version": version,
                     "width": width,
@@ -706,6 +1170,7 @@ def collect_devices(refresh: bool):
                 print(f"Error reading device {d.serial}: {e}", flush=True)
                 devices.append({
                     "serial": d.serial,
+                    "platform": "android",
                     "model": device_aliases.get(d.serial, d.serial),
                     "version": "?", "width": 0, "height": 0,
                     "ip": "?", "sdk": "?", "battery": "?",
@@ -721,6 +1186,7 @@ def collect_devices(refresh: bool):
                 continue
             devices.append({
                 "serial": serial,
+                "platform": "android",
                 "model": device_aliases.get(serial, serial),
                 "version": "?", "width": 0, "height": 0,
                 "ip": "?", "sdk": "?", "battery": "?",
@@ -729,6 +1195,18 @@ def collect_devices(refresh: bool):
                 "state_hint": STATE_LABELS.get(state, f"사용 불가 상태: {state}"),
                 "occupied_by": None, "occupied_until": None
             })
+
+        # 미러링 중인 아이폰은 기기 한 대로 같이 실립니다. 맥이 아니거나
+        # phone-harness가 없으면 줄 자체가 없습니다 — 안드로이드만 쓰는 팜에
+        # 쓸 수 없는 칸이 하나 더 생기는 게 더 나쁩니다.
+        if ios.available():
+            # 연결 상태는 마지막으로 확인해 둔 값만 씁니다. 여기서 직접 물어보면
+            # 대시보드 폴링 2초마다 맥이 캡처와 OCR을 돌게 됩니다 (확인은
+            # /api/health에서 TTL을 두고 합니다).
+            devices.append(ios.device_entry(
+                lease=get_lease(ios.IOS_SERIAL),
+                alias=device_aliases.get(ios.IOS_SERIAL),
+                state=ios.cached_state()))
 
         return {"devices": devices}
     except Exception as e:
@@ -1078,6 +1556,8 @@ async def send_input(serial: str, req: InputRequest):
     if conflict:
         return conflict
     event = req.model_dump(exclude_none=True)
+    if ios.is_ios(serial):
+        return await ios_input(event)
     try:
         await dispatch_input(get_adb_path(), serial, event)
     except ValueError as bad_event:
@@ -1095,6 +1575,333 @@ async def send_input(serial: str, req: InputRequest):
         active_recordings[serial].append(step)
 
     return {"status": "success"}
+
+# --- AI Agent Verbs ---
+# The input API above speaks in pixels: an agent that has to compute them first
+# spends most of its turns guessing. These verbs are the vocabulary an agent
+# actually uses -- read the screen, press the thing that says X, type, wait for
+# the screen to settle -- and they are the same five calls on both platforms.
+#
+# Why uiautomator and not OCR on Android: the device already knows its own view
+# tree, with text and exact bounds, and reading it costs no extra dependency and
+# no recognition error. OCR earns its place on iOS, where the mirror window is
+# all we get. The gap is real and documented: uiautomator sees nothing inside a
+# WebView, a game canvas, or a FLAG_SECURE window -- fall back to screenshot()
+# and coordinates there.
+#
+# Lease policy matches the rest of the farm: verbs that change the device need
+# the lease, verbs that only look at it do not (screenshot never has).
+
+BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+
+def parse_bounds(raw: str):
+    """`[0,84][1080,252]` -> a rect plus its centre, or None if it is not one."""
+    m = BOUNDS_RE.search(raw or "")
+    if not m:
+        return None
+    x1, y1, x2, y2 = (int(v) for v in m.groups())
+    return {
+        "bounds": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        "center": {"x": (x1 + x2) // 2, "y": (y1 + y2) // 2},
+    }
+
+def parse_ui_dump(xml_text: str):
+    """Turn a uiautomator dump into the element list the verbs work on.
+
+    Nodes without text and without a content-desc are dropped: they are layout
+    containers, and handing an agent four hundred FrameLayouts buries the six
+    things it can actually press.
+    """
+    import xml.etree.ElementTree as ET
+
+    # `uiautomator dump` prints a human line after the XML on some builds
+    # ("UI hierchary dumped to: ..." -- their spelling), which is not valid XML.
+    start = xml_text.find("<?xml")
+    if start == -1:
+        start = xml_text.find("<hierarchy")
+    if start == -1:
+        raise ValueError("uiautomator 덤프에서 XML을 찾지 못했습니다")
+    end = xml_text.rfind("</hierarchy>")
+    body = xml_text[start:end + len("</hierarchy>")] if end != -1 else xml_text[start:]
+
+    root = ET.fromstring(body)
+    elements = []
+    for node in root.iter("node"):
+        text = (node.get("text") or "").strip()
+        desc = (node.get("content-desc") or "").strip()
+        if not text and not desc:
+            continue
+        rect = parse_bounds(node.get("bounds", ""))
+        if not rect:
+            continue
+        elements.append({
+            "text": text,
+            "content_desc": desc,
+            "resource_id": node.get("resource-id") or "",
+            "class": node.get("class") or "",
+            "clickable": node.get("clickable") == "true",
+            "enabled": node.get("enabled") == "true",
+            **rect,
+        })
+    return elements
+
+async def dump_ui_elements(serial: str):
+    """Read the device's view tree.
+
+    `exec-out uiautomator dump /dev/tty` is one round trip, but some vendor
+    builds refuse /dev/tty, so fall back to writing a file and reading it back.
+    Held under the device lock: uiautomator and screencap fight over the device
+    and the loser returns an empty dump.
+    """
+    adb_path = get_adb_path()
+    async with get_device_lock(serial):
+        try:
+            out = await adb_capture(adb_path, serial, "exec-out",
+                                    "uiautomator", "dump", "/dev/tty")
+            return parse_ui_dump(out)
+        except Exception as direct_err:
+            print(f"[{serial}] uiautomator /dev/tty dump failed: {direct_err}")
+
+        remote = "/sdcard/window_dump.xml"
+        await adb_exec(adb_path, serial, "shell", "uiautomator", "dump", remote)
+        try:
+            out = await adb_capture(adb_path, serial, "exec-out", "cat", remote)
+        finally:
+            try:
+                await adb_exec(adb_path, serial, "shell", "rm", "-f", remote)
+            except Exception:
+                pass  # A leftover dump file is not worth failing the call over.
+        return parse_ui_dump(out)
+
+def find_elements(elements, text: str, exact: bool = False):
+    """Elements whose text or content-desc matches, best matches first.
+
+    Exact hits are ranked ahead of partial ones even in loose mode, so
+    tap_text("확인") presses the button that says 확인 rather than the label that
+    says "확인하려면 여기를 누르세요".
+    """
+    needle = (text or "").strip()
+    if not needle:
+        return []
+    lowered = needle.casefold()
+
+    exact_hits, loose_hits = [], []
+    for el in elements:
+        for field in (el["text"], el["content_desc"]):
+            if not field:
+                continue
+            if field.strip() == needle or field.strip().casefold() == lowered:
+                exact_hits.append(el)
+                break
+            if not exact and lowered in field.casefold():
+                loose_hits.append(el)
+                break
+    return exact_hits + loose_hits
+
+def images_similar(a: bytes, b: bytes, threshold: float) -> bool:
+    """Do two screenshots show the same thing?
+
+    Downscaled to 64px grayscale first: a live screen never produces two
+    byte-identical frames (clock, blinking cursor, compression noise), so an
+    equality check would report "never stable" on a device that is sitting
+    still. The mean per-pixel difference, as a fraction of full scale, is what
+    the threshold is measured in.
+    """
+    import io
+    from PIL import Image, ImageChops, ImageStat
+
+    if not a or not b:
+        return False
+    ia = Image.open(io.BytesIO(a)).convert("L").resize((64, 64))
+    ib = Image.open(io.BytesIO(b)).convert("L").resize((64, 64))
+    diff = ImageChops.difference(ia, ib)
+    return (ImageStat.Stat(diff).mean[0] / 255.0) <= threshold
+
+async def agent_screen_frame(serial: str):
+    """A small screenshot for comparison purposes, on either platform."""
+    if ios.is_ios(serial):
+        return await ios.adapter.screenshot(full=False)
+    async with get_device_lock(serial):
+        data, _ = await asyncio.to_thread(capture_screenshot_bytes, serial, False, (200, 400))
+    return data
+
+class TapTextRequest(BaseModel):
+    text: str
+    index: int = 0
+    exact: bool = False
+    owner: str = None
+
+class TypeTextRequest(BaseModel):
+    text: str
+    owner: str = None
+
+class OpenAppRequest(BaseModel):
+    # Android identifies an app by package, iOS by the name on the home screen.
+    package: str = None
+    name: str = None
+    owner: str = None
+
+class WaitStableRequest(BaseModel):
+    timeout: float = 10.0
+    interval: float = 0.5
+    threshold: float = 0.02
+    owner: str = None
+
+def agent_error(message: str, status: int = 400):
+    return JSONResponse({"status": "error", "message": message}, status_code=status)
+
+@app.get("/api/agent/{serial}/elements")
+async def agent_elements(serial: str):
+    """What is on the screen right now, with the coordinates to press it."""
+    try:
+        if ios.is_ios(serial):
+            if not ios.available():
+                return ios_unavailable_response()
+            elements = await ios.adapter.ocr()
+            size = await ios.adapter.screen_size()
+        else:
+            elements = await dump_ui_elements(serial)
+            size = await asyncio.to_thread(get_device_resolution, serial)
+    except ValueError as bad:
+        return agent_error(str(bad))
+    except Exception as e:
+        # An agent that gets this usually asked mid-animation; tell it what to do.
+        return agent_error(
+            f"화면을 읽지 못했습니다: {e} (화면 전환 중이면 wait-stable 후 다시 시도하세요)",
+            status=503)
+
+    width, height = size if size else (0, 0)
+    return {"status": "success", "count": len(elements),
+            "width": width, "height": height, "elements": elements}
+
+@app.post("/api/agent/{serial}/tap-text")
+async def agent_tap_text(serial: str, req: TapTextRequest):
+    """Press the thing that says X. The coordinates are our problem, not the agent's."""
+    conflict = lease_conflict(serial, req.owner)
+    if conflict:
+        return conflict
+
+    try:
+        if ios.is_ios(serial):
+            if not ios.available():
+                return ios_unavailable_response()
+            elements = await ios.adapter.ocr()
+        else:
+            elements = await dump_ui_elements(serial)
+    except Exception as e:
+        return agent_error(f"화면을 읽지 못했습니다: {e}", status=503)
+
+    matches = find_elements(elements, req.text, req.exact)
+    if not matches:
+        return agent_error(
+            f"화면에서 '{req.text}' 텍스트를 찾지 못했습니다 "
+            f"(보이는 텍스트 {len(elements)}개). elements로 확인하세요.",
+            status=404)
+    if req.index >= len(matches):
+        return agent_error(
+            f"'{req.text}' 일치 항목은 {len(matches)}개인데 index={req.index}를 요청했습니다")
+
+    target = matches[req.index]
+    center = target["center"]
+    try:
+        if ios.is_ios(serial):
+            await ios.adapter.tap(center["x"], center["y"])
+        else:
+            # Through dispatch_input, not straight to adb: every input the farm
+            # sends goes past one validation point, this one included.
+            await dispatch_input(get_adb_path(), serial,
+                                 {"type": "tap", "x": center["x"], "y": center["y"]})
+            record_agent_step(serial, {"type": "tap", **center})
+    except Exception as e:
+        return agent_error(str(e), status=500)
+
+    return {"status": "success", "tapped": target, "matches": len(matches)}
+
+@app.post("/api/agent/{serial}/type-text")
+async def agent_type_text(serial: str, req: TypeTextRequest):
+    conflict = lease_conflict(serial, req.owner)
+    if conflict:
+        return conflict
+    try:
+        if ios.is_ios(serial):
+            if not ios.available():
+                return ios_unavailable_response()
+            await ios.adapter.type_text(req.text)
+        else:
+            await dispatch_input(get_adb_path(), serial, {"type": "text", "text": req.text})
+            record_agent_step(serial, {"type": "text", "text": req.text})
+    except ValueError as bad:
+        return agent_error(str(bad))
+    except Exception as e:
+        return agent_error(str(e), status=500)
+    return {"status": "success"}
+
+@app.post("/api/agent/{serial}/open-app")
+async def agent_open_app(serial: str, req: OpenAppRequest):
+    conflict = lease_conflict(serial, req.owner)
+    if conflict:
+        return conflict
+
+    if ios.is_ios(serial):
+        if not ios.available():
+            return ios_unavailable_response()
+        if not req.name:
+            return agent_error("iOS는 앱 이름이 필요합니다: {\"name\": \"Notes\"}")
+        try:
+            await ios.adapter.open_app(req.name)
+        except Exception as e:
+            return agent_error(str(e), status=500)
+        return {"status": "success", "name": req.name}
+
+    if not req.package:
+        return agent_error("안드로이드는 패키지명이 필요합니다: "
+                           "{\"package\": \"com.android.settings\"}")
+    try:
+        # Same monkey launch the dashboard's app control uses.
+        await run_app_action(serial, "launch", req.package)
+    except ValueError as bad:
+        return agent_error(str(bad))
+    except Exception as e:
+        return agent_error(str(e), status=500)
+    return {"status": "success", "package": req.package}
+
+@app.post("/api/agent/{serial}/wait-stable")
+async def agent_wait_stable(serial: str, req: WaitStableRequest):
+    """Block until the screen stops changing.
+
+    A timeout answers 200 with stable=false on purpose. "The screen is still
+    moving" is information the agent acts on -- it waits again, or gives up and
+    reads anyway -- not a server fault, and a 5xx would just make it retry the
+    whole call.
+    """
+    if ios.is_ios(serial) and not ios.available():
+        return ios_unavailable_response()
+
+    deadline = time.monotonic() + max(0.1, req.timeout)
+    interval = min(max(0.05, req.interval), 5.0)
+    started = time.monotonic()
+    checks = 0
+
+    try:
+        previous = await agent_screen_frame(serial)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(interval)
+            current = await agent_screen_frame(serial)
+            checks += 1
+            if previous and current and images_similar(previous, current, req.threshold):
+                return {"status": "success", "stable": True,
+                        "waited": round(time.monotonic() - started, 2), "checks": checks}
+            previous = current
+    except Exception as e:
+        return agent_error(f"화면을 비교하지 못했습니다: {e}", status=503)
+
+    return {"status": "success", "stable": False,
+            "waited": round(time.monotonic() - started, 2), "checks": checks}
+
+def record_agent_step(serial: str, step: dict):
+    """Agent verbs land in a running macro recording like any other input."""
+    if serial in active_recordings:
+        active_recordings[serial].append({**step, "timestamp": time.time()})
 
 def adb_server_info():
     """Which adb server is answering on port 5037, and does it look stale.
@@ -1119,7 +1926,15 @@ def adb_server_info():
 @app.get("/api/health")
 async def health():
     """Liveness probe: is the server up, and can it still talk to adb?"""
-    return await asyncio.to_thread(check_health)
+    # 아이폰 연결 상태는 여기서만 실제로 확인합니다 (TTL이 걸려 있어 모니터링이
+    # 자주 불러도 맥이 매번 OCR을 돌지는 않습니다). 기기 목록은 이 결과를
+    # 재사용합니다.
+    ios_state = await ios.refresh_state()
+    result = await asyncio.to_thread(check_health)
+    if isinstance(result, dict) and ios_state:
+        result["ios"] = {**result["ios"], "connection": ios_state,
+                         "connection_hint": ios.STATE_HINTS.get(ios_state)}
+    return result
 
 def check_health():
     try:
@@ -1148,6 +1963,15 @@ def check_health():
             # connection dies with it. That failure is invisible from the client
             # path alone, so surface what is actually answering on port 5037.
             "adb_server": adb_server_info(),
+            # iOS는 있으면 좋고 없으면 그만인 부가 기능이라 status에 영향을
+            # 주지 않습니다. 다만 왜 안 보이는지는 여기서 말합니다.
+            "ios": ios.ios_status(),
+            # 배포본이면 이 설치본의 ID와 마지막 확인 결과. 사용자가 자기 ID를
+            # 알아야 배포자에게 문의할 수 있고, 숨길 이유도 없습니다.
+            "distribution": ({"install_id": CONTROL_STATE.get("install_id"),
+                              "checked_at": CONTROL_STATE.get("checked_at"),
+                              "source": CONTROL_STATE.get("source")}
+                             if CONTROL_STATE else None),
         }
     except Exception as e:
         return JSONResponse(
@@ -1157,7 +1981,7 @@ def check_health():
 
 # --- Macro System ---
 
-MACROS_DIR = "macros"
+MACROS_DIR = app_data("macros")
 if not os.path.exists(MACROS_DIR):
     os.makedirs(MACROS_DIR)
 
@@ -1492,7 +2316,7 @@ async def reap_logcat(serial: str, session: dict):
     except Exception as e:
         print(f"[{serial}] Logcat reap: {e}")
 
-LOGCAT_DIR = "logs"
+LOGCAT_DIR = app_data("logs")
 
 class LogcatStartRequest(BaseModel):
     clear: bool = True          # drop whatever is already buffered on the device
@@ -1666,6 +2490,11 @@ async def gather_per_device(serials, coro_factory, owner=None):
         raise ValueError("No serials given")
 
     async def one(serial):
+        # 배치는 안드로이드 기기용입니다. 아이폰이 섞여 들어오면 나머지를
+        # 실패시키지 않고 그 한 줄만 건너뜁니다 — 점유된 기기와 같은 처리입니다.
+        if ios.is_ios(serial):
+            return {"serial": serial, "status": "skipped",
+                    "message": "iOS 미러링 기기는 배치 작업 대상이 아닙니다"}
         blocked = lease_block_reason(serial, owner)
         if blocked:
             return {"serial": serial, "status": "skipped", "message": blocked}
@@ -1791,9 +2620,8 @@ async def start_audio(serial: str):
             else:
                 del active_audio_procs[serial] # Cleanup dead process
 
-        exe = "scrcpy.exe" if os.name == "nt" else "scrcpy"
-        scrcpy_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrcpy_bin", exe)
-        if not os.path.exists(scrcpy_bin):
+        scrcpy_bin = bundled_tool("scrcpy")
+        if not scrcpy_bin:
             found = shutil.which("scrcpy")
             if not found:
                 # The binary is not redistributed with this repo, so say where
@@ -1880,12 +2708,79 @@ def port_owner(host: str, port: int):
         probe.close()
 
 
+def lan_addresses():
+    """다른 PC가 이 팜을 부를 때 쓸 IPv4 주소들.
+
+    호스트 이름으로 찾으면 흔히 127.0.0.1만 나오거나(리눅스의 /etc/hosts) 죽은
+    인터페이스까지 딸려 옵니다. 대신 바깥으로 UDP 소켓을 하나 여는 척해서 OS가
+    고른 인터페이스를 물어봅니다 -- 패킷은 나가지 않고, 라우팅 테이블만 씁니다.
+    """
+    import socket
+
+    found = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 9))   # TEST-NET-1, 실제로 통신하지 않습니다
+            found.append(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except Exception:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = info[4][0]
+            if not address.startswith("127.") and address not in found:
+                found.append(address)
+    except Exception:
+        pass
+
+    return found
+
+
 if __name__ == "__main__":
     import uvicorn
 
     host = os.environ.get("DEVICE_FARM_HOST", "0.0.0.0")
     port = int(os.environ.get("DEVICE_FARM_PORT", "8001"))
     stream_port = get_stream_port()
+
+    ensure_local_adb()
+
+    def hold_window():
+        """배포본이 비정상 종료할 때 창이 닫히기 전에 멈춥니다.
+
+        더블클릭으로 띄운 콘솔 창은 프로세스가 끝나는 순간 사라집니다. 그러면
+        사용자가 보는 것은 "갑자기 꺼졌다"뿐이고, 정작 원인을 적어 둔 줄은 같이
+        사라집니다. 실제로 그렇게 한 번 잃었습니다.
+        """
+        if not FROZEN:
+            return
+        try:
+            input("\n창을 닫으려면 Enter를 누르세요...")
+        except Exception:
+            pass
+
+    # 배포한 빌드는 배포자가 원격으로 멈출 수 있어야 합니다. 소스에서 돌릴 때는
+    # 검사하지 않습니다 -- 그쪽은 어차피 코드를 들고 있어서 통제할 수도 없고,
+    # 개발 중에 네트워크를 요구할 이유도 없습니다.
+    if FROZEN and os.environ.get("DEVICE_FARM_SKIP_CONTROL", "").strip() != "1":
+        state = dist_control.evaluate(APP_HOME)
+        if not state["allowed"]:
+            print("=" * 62)
+            print("  QA Device Farm - 실행할 수 없습니다")
+            print()
+            print(f"  {state['message']}")
+            print()
+            print(f"  설치 ID   {state['install_id']}")
+            print(f"  확인 위치 {dist_control.control_url()}")
+            print()
+            print("  배포자에게 문의하세요.")
+            print("=" * 62)
+            hold_window()
+            sys.exit(2)
+        CONTROL_STATE.update(state)
 
     if port_owner(host, port):
         print(f"[ERROR] Port {port} is already in use, so the dashboard cannot start.")
@@ -1895,13 +2790,28 @@ if __name__ == "__main__":
         print("        Then stop that program, or pick another port:")
         print("          set DEVICE_FARM_PORT=8002   (Windows)")
         print("          export DEVICE_FARM_PORT=8002")
+        hold_window()
         sys.exit(1)
 
     print("=" * 62)
     print("  QA Device Farm")
     print(f"  Dashboard   http://localhost:{port}/")
+    # 이 팜의 요점은 기기를 자기 PC에서 떼어내 남들이 쓰게 하는 것입니다.
+    # localhost만 찍으면 그게 안 되는 물건처럼 보여서, 남이 실제로 칠 주소를
+    # 같이 보여줍니다. 대시보드는 스트림 주소를 자기가 열린 호스트로 조립하므로
+    # 이 주소로 들어오면 미러링까지 그대로 따라옵니다.
+    if host in ("0.0.0.0", "::"):
+        for address in lan_addresses():
+            print(f"              http://{address}:{port}/   <- 다른 PC에서")
+    else:
+        print(f"  Bound to    {host} (이 주소로만 접근됩니다)")
     print(f"  API docs    http://localhost:{port}/docs")
-    print(f"  Stream      port {stream_port} (ws-scrcpy, started separately)")
+    # 배포본은 미러링 서버를 이 프로세스가 직접 띄웁니다. 소스로 돌 때만 사람이
+    # 따로 `npm start` 해야 하므로, 둘을 구분해서 적습니다.
+    if FROZEN:
+        print(f"  Stream      port {stream_port} (ws-scrcpy, 같이 실행됩니다)")
+    else:
+        print(f"  Stream      port {stream_port} (ws-scrcpy, started separately)")
     adb_bin = adb_binary_info()
     print(f"  adb         {adb_bin['path']}")
     if not adb_bin["ok"]:
@@ -1910,6 +2820,12 @@ if __name__ == "__main__":
         print("              still work because adbutils uses the adb server.")
         print("              Install platform-tools on PATH, or copy adb into")
         print("              scrcpy_bin/.")
+    ios_state = ios.ios_status()
+    if ios_state["available"]:
+        print(f"  iOS         phone-harness {ios_state['binary']}")
+        print(f"              iPhone shows up as '{ios.IOS_SERIAL}'")
+    else:
+        print(f"  iOS         off - {ios_state['reason']}")
     if FARM_TOKEN:
         print("  Access      token required (DEVICE_FARM_TOKEN is set)")
     else:
@@ -1917,4 +2833,18 @@ if __name__ == "__main__":
         print("              devices. Set DEVICE_FARM_TOKEN before exposing the farm.")
     print("=" * 62)
 
-    uvicorn.run(app, host=host, port=port)
+    try:
+        uvicorn.run(app, host=host, port=port)
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        # 여기까지 온 예외는 사용자가 볼 수 있어야 합니다. 배포본은 창이 닫히면서
+        # 스택 트레이스까지 같이 사라집니다.
+        import traceback
+        print()
+        print("=" * 62)
+        print("  QA Device Farm이 예기치 않게 종료됐습니다.")
+        print("=" * 62)
+        traceback.print_exc()
+        hold_window()
+        sys.exit(1)

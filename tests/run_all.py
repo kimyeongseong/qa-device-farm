@@ -23,6 +23,11 @@ SUITES = [
     ("test_features.py", "macros, app control, logcat, batch, cache, wireless serials"),
     ("test_edge_cases.py", "dead capture recovery, corrupt files, odd serials"),
     ("test_cli.py", "cli.py driven as a real subprocess"),
+    ("test_agent_verbs.py", "AI verbs: uiautomator parsing, tap_text, text quoting, wait_stable"),
+    ("test_ios_provider.py", "iOS pseudo-device, graceful degradation, android-only guards"),
+    ("test_ios_scripts.py", "phone-harness script templates: signatures and coordinate conversion"),
+    ("test_cli_harness.py", "harness script runner and skill generation"),
+    ("test_dist_control.py", "remote kill switch: verdicts, offline grace, cached blocks"),
 ]
 
 

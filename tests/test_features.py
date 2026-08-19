@@ -342,9 +342,23 @@ server.shutil.which = lambda n: "/usr/local/bin/adb" if n == "adb" else None
 check("falls back to PATH when no bundled adb",
       server.get_adb_path() in ("/usr/local/bin/adb",), server.get_adb_path())
 server.shutil.which = lambda n: None
+# adbutils carries an adb of its own on some platforms, and that is tried before
+# giving up. It is a real answer, so accept it here; the no-adb-anywhere case is
+# the check below it.
+p = server.get_adb_path()
+check("falls back to the adb adbutils ships, when it has one",
+      p == "adb" or p.endswith("adb.exe") or "adbutils" in p, p)
+
+# Nothing bundled, nothing on PATH, and adbutils has no copy either: the answer
+# has to stay a plain platform-appropriate guess rather than a broken path, so
+# adb_binary_info() can report it as missing.
+import adbutils as _adbutils
+_real_adb_path = _adbutils.adb_path
+_adbutils.adb_path = lambda: "/nonexistent/adb"
 p = server.get_adb_path()
 check("last-resort path is platform-appropriate",
       p.endswith("adb.exe") if os.name == "nt" else p == "adb", p)
+_adbutils.adb_path = _real_adb_path
 
 # A bundled copy wins so a host can pin a known adb version.
 server.os.path.exists = bundled(True)

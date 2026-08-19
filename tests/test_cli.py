@@ -75,8 +75,13 @@ cases = [
      ["CLI_A", "shell", "input", "swipe", "1", "2", "3", "4", "250"]),
     (["key", "--serial", "CLI_A", "--keycode", "3"],
      ["CLI_A", "shell", "input", "keyevent", "3"]),
+    # Quoted for the *device* shell: adb rebuilds the command line on the phone,
+    # so an unquoted argument gets split there. See android_text_arg().
     (["text", "--serial", "CLI_A", "--value", "qa"],
-     ["CLI_A", "shell", "input", "text", "qa"]),
+     ["CLI_A", "shell", "input", "text", "'qa'"]),
+    # This one used to type "hello" and drop the rest.
+    (["text", "--serial", "CLI_A", "--value", "hello world"],
+     ["CLI_A", "shell", "input", "text", "'hello%sworld'"]),
 ]
 for args, expected in cases:
     reset_calls()

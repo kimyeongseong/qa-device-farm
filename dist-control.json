@@ -1,0 +1,14 @@
+{
+  "_설명": "배포한 빌드의 사용 여부를 여기서 조절합니다. 이 파일만 고치면 됩니다.",
+  "_사용법": [
+    "전부 막기    : allowed 를 false 로 바꾸고 message 에 사유를 씁니다.",
+    "한 명만 막기 : blocked_ids 에 그 사람의 설치 ID를 넣습니다.",
+    "설치 ID 확인 : 사용자가 실행할 때 콘솔에 찍히고, /api/health 에도 나옵니다.",
+    "되돌리기     : allowed 를 true 로, blocked_ids 에서 빼면 됩니다.",
+    "반영 시점    : 다음 실행 때. 켜져 있는 팜은 최대 6시간 안에 반영됩니다."
+  ],
+  "allowed": true,
+  "message": "",
+  "blocked_ids": [],
+  "blocked_message": ""
+}
