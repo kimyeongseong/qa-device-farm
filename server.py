@@ -2504,6 +2504,37 @@ def port_owner(host: str, port: int):
         probe.close()
 
 
+def lan_addresses():
+    """다른 PC가 이 팜을 부를 때 쓸 IPv4 주소들.
+
+    호스트 이름으로 찾으면 흔히 127.0.0.1만 나오거나(리눅스의 /etc/hosts) 죽은
+    인터페이스까지 딸려 옵니다. 대신 바깥으로 UDP 소켓을 하나 여는 척해서 OS가
+    고른 인터페이스를 물어봅니다 -- 패킷은 나가지 않고, 라우팅 테이블만 씁니다.
+    """
+    import socket
+
+    found = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 9))   # TEST-NET-1, 실제로 통신하지 않습니다
+            found.append(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except Exception:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = info[4][0]
+            if not address.startswith("127.") and address not in found:
+                found.append(address)
+    except Exception:
+        pass
+
+    return found
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -2524,6 +2555,15 @@ if __name__ == "__main__":
     print("=" * 62)
     print("  QA Device Farm")
     print(f"  Dashboard   http://localhost:{port}/")
+    # 이 팜의 요점은 기기를 자기 PC에서 떼어내 남들이 쓰게 하는 것입니다.
+    # localhost만 찍으면 그게 안 되는 물건처럼 보여서, 남이 실제로 칠 주소를
+    # 같이 보여줍니다. 대시보드는 스트림 주소를 자기가 열린 호스트로 조립하므로
+    # 이 주소로 들어오면 미러링까지 그대로 따라옵니다.
+    if host in ("0.0.0.0", "::"):
+        for address in lan_addresses():
+            print(f"              http://{address}:{port}/   <- 다른 PC에서")
+    else:
+        print(f"  Bound to    {host} (이 주소로만 접근됩니다)")
     print(f"  API docs    http://localhost:{port}/docs")
     print(f"  Stream      port {stream_port} (ws-scrcpy, started separately)")
     adb_bin = adb_binary_info()

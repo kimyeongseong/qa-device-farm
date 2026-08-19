@@ -224,11 +224,8 @@ STREAM_PID=$!
 # 창을 닫으면 미러링 서버도 같이 내려가야 합니다. 남으면 포트를 쥔 채 떠돕니다.
 trap 'kill $STREAM_PID 2>/dev/null' EXIT
 
+# 접속 주소는 서버가 직접 찍습니다 -- 다른 PC에서 쓸 LAN 주소까지 같이 나옵니다.
 echo "대시보드를 시작합니다..."
-echo "==================================================="
-echo "  대시보드   http://localhost:8001/"
-echo "  API 문서   http://localhost:8001/docs"
-echo "==================================================="
 ./{app_name}/{app_name}
 """
 
@@ -279,10 +276,10 @@ set "DEVICE_FARM_HOME=%~dp0"
 echo 미러링 서버를 시작합니다...
 start "QA Device Farm - 미러링" /min "%~dp0node\\node.exe" "%~dp0ws-scrcpy\\index.js"
 
-echo ===================================================
-echo   대시보드   http://localhost:8001/
-echo   API 문서   http://localhost:8001/docs
-echo ===================================================
+:: 접속 주소는 서버가 직접 찍습니다 -- 다른 PC에서 쓸 LAN 주소까지 같이 나옵니다.
+:: 다른 PC에서 안 열리면 십중팔구 방화벽입니다. 관리자 권한 PowerShell에서:
+::   New-NetFirewallRule -DisplayName "QA Device Farm" -Direction Inbound ^
+::     -LocalPort 8001,8010 -Protocol TCP -Action Allow
 "%~dp0{app_name}\\{app_name}.exe"
 """
 
@@ -330,6 +327,21 @@ https://github.com/Genymobile/scrcpy/releases
 - `device_aliases.json` — 기기 별칭
 - `macros/` — 녹화한 매크로
 - `logs/` — 파일로 저장한 logcat
+
+## 다른 PC에서 접속하기
+
+팜의 요점은 기기를 이 PC에 묶어두지 않는 것입니다. 실행하면 콘솔에 다른 PC에서
+쓸 주소(`http://192.168.x.x:8001/`)가 같이 나오니 그걸 알려주면 됩니다. 대시보드가
+미러링 주소를 접속한 호스트 기준으로 조립하므로 화면도 그대로 따라옵니다.
+
+안 열리면 대부분 **방화벽**입니다. 관리자 권한 PowerShell에서 한 번만:
+
+```
+New-NetFirewallRule -DisplayName "QA Device Farm" -Direction Inbound `
+  -LocalPort 8001,8010 -Protocol TCP -Action Allow
+```
+
+맥은 처음 실행할 때 "네트워크 연결 허용" 창이 뜨면 허용하면 됩니다.
 
 ## 팜을 밖으로 열 때
 
