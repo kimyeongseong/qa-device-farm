@@ -267,12 +267,21 @@ async def start_bundled_stream_server():
     if not FROZEN:
         return
 
-    node = os.path.join(BUNDLE_DIR, "node", "node.exe" if os.name == "nt" else "node")
     entry = os.path.join(BUNDLE_DIR, "ws-scrcpy", "index.js")
-    if not (os.path.exists(node) and os.path.exists(entry)):
-        return  # Node를 빼고 만든 배포본. 간이 미러링은 그대로 됩니다.
+    if not os.path.exists(entry):
+        return  # 미러링 서버를 빼고 만든 배포본. 간이 미러링은 그대로 됩니다.
 
-    if not os.name == "nt":
+    node = os.path.join(BUNDLE_DIR, "node", "node.exe" if os.name == "nt" else "node")
+    if not os.path.exists(node):
+        # Node를 빼고 만든(작은) 배포본이거나 꺼내기에 실패한 경우. PC에 설치된
+        # Node가 있으면 그걸로 돌립니다 -- 고화질 미러링을 포기할 이유는 없습니다.
+        node = shutil.which("node")
+        if not node:
+            print("[stream] Node를 찾지 못해 고화질 미러링을 건너뜁니다.")
+            print("[stream] 간이 미러링은 그대로 쓸 수 있습니다.")
+            return
+
+    if os.name != "nt" and node.startswith(BUNDLE_DIR):
         try:
             os.chmod(node, 0o755)   # zip을 거치면 실행 권한이 날아갑니다.
         except OSError:
