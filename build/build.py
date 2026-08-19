@@ -69,17 +69,23 @@ def platform_tag():
 
 # --- 1. 팜 서버 ---
 
-def build_server(dist_root):
-    """PyInstaller로 server.py를 묶습니다.
+def build_server(dist_root, staging):
+    """PyInstaller로 server.py를 묶습니다. 결과는 실행 파일 하나입니다.
 
-    onefile이 아니라 onedir입니다. onefile은 실행할 때마다 임시 폴더에 통째로
-    풀어서 기동이 느리고, 무엇보다 백신이 자주 걸고 넘어집니다. 폴더째 주면
-    안에 뭐가 들었는지 눈으로 볼 수도 있습니다.
+    onedir로 시작했다가 onefile로 바꿨습니다. 이유는 두 가지입니다.
+
+    받는 사람 입장에서 파일 하나가 훨씬 낫습니다. 폴더로 주면 `_internal`을
+    열어 보고 뭔가 지우는 사람이 반드시 나오고, 그러면 원인 모를 고장으로
+    돌아옵니다. 그리고 미러링 서버(Node + ws-scrcpy)까지 안에 넣어 두면 서버가
+    직접 띄울 수 있어서, 배치 파일로 프로세스 두 개를 관리할 필요가 없어집니다.
+
+    대신 두 가지를 감수합니다. 실행할 때마다 임시 폴더에 풀어서 기동이 몇 초
+    걸리고, 백신이 onefile을 더 자주 걸고 넘어집니다. 안내문에 적어 둡니다.
     """
     sep = ";" if os.name == "nt" else ":"
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--noconfirm", "--clean",
+        "--noconfirm", "--clean", "--onefile",
         "--name", APP_NAME,
         "--distpath", dist_root,
         "--workpath", os.path.join(BUILD_DIR, "work"),
@@ -102,8 +108,16 @@ def build_server(dist_root):
         # 커지고, 파이썬이 두 벌 깔린 빌드 머신에서는 훅이 터집니다.
         "--exclude-module", "cryptography",
         "--console",
-        os.path.join(ROOT, "server.py"),
     ]
+
+    # 미러링 서버를 통째로 EXE 안에 넣습니다. server.py가 기동할 때 여기서
+    # 꺼내 직접 띄웁니다.
+    for name in ("node", "ws-scrcpy"):
+        staged = os.path.join(staging, name)
+        if os.path.isdir(staged):
+            cmd += ["--add-data", f"{staged}{sep}{name}"]
+
+    cmd.append(os.path.join(ROOT, "server.py"))
     run(cmd)
 
 
@@ -198,156 +212,79 @@ def build_ws_scrcpy(app_dir):
 
 # --- 4. 실행 스크립트와 안내 ---
 
-LAUNCHER_SH = """#!/bin/bash
-# QA Device Farm — 맥에서 더블클릭으로 실행합니다.
-cd "$(dirname "$0")"
-
-# 팜은 adb로 기기를 조작합니다. 여기 있는 것을 먼저 쓰고, 없으면 PATH에서 찾습니다.
-# ws-scrcpy는 adb를 PATH에서 직접 실행하므로 두 서버가 같은 것을 보도록 맞춥니다.
-if [ -x "./scrcpy_bin/adb" ]; then
-  export PATH="$PWD/scrcpy_bin:$PATH"
-fi
-
-# 스트림 포트는 이 파일 한 곳에서만 정의합니다.
-export WS_SCRCPY_CONFIG="$PWD/ws-scrcpy.config.json"
-
-# 점유·매크로·로그를 이 폴더에 둡니다. 지정하지 않으면 실행 파일 옆(한 단계
-# 안쪽)에 만들어져서 찾기 어렵습니다.
-export DEVICE_FARM_HOME="$PWD"
-
-# 팜을 사내망 밖으로 열 때는 아래 주석을 풀고 긴 임의 문자열을 넣으세요.
-# export DEVICE_FARM_TOKEN="여기에-긴-임의-문자열"
-
-echo "미러링 서버를 시작합니다..."
-./node/node ./ws-scrcpy/index.js &
-STREAM_PID=$!
-# 창을 닫으면 미러링 서버도 같이 내려가야 합니다. 남으면 포트를 쥔 채 떠돕니다.
-trap 'kill $STREAM_PID 2>/dev/null' EXIT
-
-# 접속 주소는 서버가 직접 찍습니다 -- 다른 PC에서 쓸 LAN 주소까지 같이 나옵니다.
-echo "대시보드를 시작합니다..."
-./{app_name}/{app_name}
-"""
-
-LAUNCHER_BAT = """@echo off
-chcp 65001 >nul
-title QA Device Farm
-cd /d "%~dp0"
-
-:: ws-scrcpy는 adb를 **PATH에서 찾아 프로세스로 띄웁니다**. 팜 서버처럼 경로를
-:: 스스로 해석하지 않기 때문에, adb가 PATH에 없으면 대시보드와 기기 목록은 멀쩡한데
-:: 미러링만 "spawn adb ENOENT"로 죽습니다.
-::
-:: 번들에는 adbutils가 들고 온 adb가 들어 있지만 _internal 안이라 PATH에 안
-:: 잡힙니다. scrcpy_bin이 비어 있으면 복사해 둡니다. adb.exe만 옮기면 안 됩니다 --
-:: 윈도우 adb는 AdbWinApi.dll이 같은 폴더에 있어야 하고, 없으면 실행하자마자
-:: 종료 코드 3221225781(0xC0000135, DLL 없음)로 죽습니다.
-set "BUNDLED_ADB=%~dp0{app_name}\\_internal\\adbutils\\binaries"
-if not exist "%~dp0scrcpy_bin" mkdir "%~dp0scrcpy_bin"
-if exist "%~dp0scrcpy_bin\\adb.exe" goto :adb_check_dll
-if not exist "%BUNDLED_ADB%\\adb.exe" goto :adb_done
-echo 번들 adb를 scrcpy_bin으로 복사합니다...
-copy /y "%BUNDLED_ADB%\\adb.exe" "%~dp0scrcpy_bin\\" >nul
-
-:adb_check_dll
-if exist "%~dp0scrcpy_bin\\AdbWinApi.dll" goto :adb_ready
-if not exist "%BUNDLED_ADB%\\AdbWinApi.dll" goto :adb_ready
-copy /y "%BUNDLED_ADB%\\AdbWinApi.dll" "%~dp0scrcpy_bin\\" >nul
-if exist "%BUNDLED_ADB%\\AdbWinUsbApi.dll" copy /y "%BUNDLED_ADB%\\AdbWinUsbApi.dll" "%~dp0scrcpy_bin\\" >nul
-
-:adb_ready
-set "PATH=%~dp0scrcpy_bin;%PATH%"
-
-:adb_done
-:: 이전에 뜬 adb 서버가 살아 있으면 그게 계속 쓰입니다. 방금 올린 adb로 다시
-:: 뜨도록 한 번 내려줍니다.
-adb kill-server >nul 2>&1
-
-:: 스트림 포트는 이 파일 한 곳에서만 정의합니다.
-set "WS_SCRCPY_CONFIG=%~dp0ws-scrcpy.config.json"
-
-:: 점유·매크로·로그를 이 폴더에 둡니다. 지정하지 않으면 실행 파일 옆(한 단계
-:: 안쪽)에 만들어져서 찾기 어렵습니다.
-set "DEVICE_FARM_HOME=%~dp0"
-
-:: 팜을 사내망 밖으로 열 때는 아래 주석을 풀고 긴 임의 문자열을 넣으세요.
-:: set "DEVICE_FARM_TOKEN=여기에-긴-임의-문자열"
-
-echo 미러링 서버를 시작합니다...
-start "QA Device Farm - 미러링" /min "%~dp0node\\node.exe" "%~dp0ws-scrcpy\\index.js"
-
-:: 접속 주소는 서버가 직접 찍습니다 -- 다른 PC에서 쓸 LAN 주소까지 같이 나옵니다.
-:: 다른 PC에서 안 열리면 십중팔구 방화벽입니다. 관리자 권한 PowerShell에서:
-::   New-NetFirewallRule -DisplayName "QA Device Farm" -Direction Inbound ^
-::     -LocalPort 8001,8010 -Protocol TCP -Action Allow
-"%~dp0{app_name}\\{app_name}.exe"
-"""
-
 READ_ME = """# QA Device Farm ({tag})
 
-압축을 풀고 아래 파일을 실행하면 됩니다. 파이썬이나 Node를 따로 설치할 필요는
-없습니다 — 둘 다 안에 들어 있습니다.
+실행 파일 하나입니다. `{exe_name}` 을 실행하면 끝입니다 — 파이썬도 Node도
+따로 설치할 필요가 없고, 미러링 서버도 이 프로그램이 알아서 같이 띄웁니다.
 
-- 맥: `시작하기.command` (더블클릭)
-- 윈도우: `시작하기.bat` (더블클릭)
+실행하면 콘솔에 주소가 나옵니다.
 
-그다음 브라우저에서 http://localhost:8001/ 을 엽니다.
-
-## adb는 직접 넣어야 합니다
-
-기기를 조작하려면 Android platform-tools의 `adb`가 필요합니다. 라이선스상 여기
-포함할 수 없어서 빠져 있습니다.
-
-1. https://developer.android.com/tools/releases/platform-tools 에서 받습니다
-2. 압축을 풀고 `adb`(윈도우는 `adb.exe`와 같이 들어 있는 dll 전부)를
-   이 폴더의 `scrcpy_bin/` 안에 넣습니다
-
-이미 PATH에 adb가 있으면 그것을 씁니다. 지금 무엇을 쓰고 있는지는
-http://localhost:8001/api/health 의 `adb_path`로 확인할 수 있습니다.
-
-## 소리도 받으려면 (선택)
-
-scrcpy 2.7 이상 바이너리를 같은 `scrcpy_bin/`에 넣으세요. GPL이라 역시 포함하지
-않았습니다. 없으면 오디오 버튼만 동작하지 않고 나머지는 정상입니다.
-
-https://github.com/Genymobile/scrcpy/releases
-
-## 맥에서 "확인되지 않은 개발자" 경고가 뜬다면
-
-서명하지 않은 빌드라 처음 한 번은 macOS가 막습니다. 둘 중 하나로 넘어갑니다.
-
-- `시작하기.command`를 **우클릭 → 열기** 후 한 번 더 열기
-- 또는 터미널에서: `xattr -dr com.apple.quarantine "이 폴더 경로"`
-
-## 만들어지는 파일
-
-실행하면 이 폴더에 다음이 생깁니다. 지워도 되지만 지우면 그 내용은 사라집니다.
-
-- `device_leases.json` — 누가 어느 기기를 쓰는 중인지
-- `device_aliases.json` — 기기 별칭
-- `macros/` — 녹화한 매크로
-- `logs/` — 파일로 저장한 logcat
+    대시보드   http://localhost:8001/
+               http://192.168.x.x:8001/   <- 다른 PC에서
 
 ## 다른 PC에서 접속하기
 
-팜의 요점은 기기를 이 PC에 묶어두지 않는 것입니다. 실행하면 콘솔에 다른 PC에서
-쓸 주소(`http://192.168.x.x:8001/`)가 같이 나오니 그걸 알려주면 됩니다. 대시보드가
-미러링 주소를 접속한 호스트 기준으로 조립하므로 화면도 그대로 따라옵니다.
+이 팜의 요점은 기기를 이 PC에만 묶어두지 않는 것입니다. 위에 나오는
+`192.168.x.x` 주소를 알려주면 다른 사람도 브라우저로 씁니다. 화면 미러링까지
+그대로 따라옵니다.
 
 안 열리면 대부분 **방화벽**입니다. 관리자 권한 PowerShell에서 한 번만:
 
-```
-New-NetFirewallRule -DisplayName "QA Device Farm" -Direction Inbound `
-  -LocalPort 8001,8010 -Protocol TCP -Action Allow
-```
+    New-NetFirewallRule -DisplayName "QA Device Farm" -Direction Inbound `
+      -LocalPort 8001,8010 -Protocol TCP -Action Allow
 
 맥은 처음 실행할 때 "네트워크 연결 허용" 창이 뜨면 허용하면 됩니다.
+
+## adb
+
+기기를 조작하려면 adb가 필요한데, 안에 들어 있어서 따로 준비하지 않아도 됩니다.
+처음 실행할 때 실행 파일 옆 `scrcpy_bin/` 폴더로 꺼내 둡니다.
+
+특정 버전을 쓰고 싶으면 그 폴더에 직접 넣으면 그게 우선합니다. 지금 무엇을 쓰는
+중인지는 http://localhost:8001/api/health 의 `adb_path`로 확인할 수 있습니다.
+
+소리까지 받으려면 scrcpy 2.7 이상을 같은 폴더에 넣으세요(GPL이라 포함하지
+않았습니다). https://github.com/Genymobile/scrcpy/releases
+
+## 처음 실행할 때 느리거나 경고가 뜬다면
+
+- **기동에 몇 초 걸립니다.** 실행 파일 하나에 다 들어 있어서, 실행할 때마다
+  임시 폴더에 풀고 시작합니다. 두 번째부터는 조금 빨라집니다.
+- **백신이 경고할 수 있습니다.** 서명하지 않은 단일 실행 파일이라 그렇습니다.
+  실행 허용으로 두시면 됩니다.
+- **맥은 "확인되지 않은 개발자"** 경고가 뜹니다. 우클릭 → 열기로 한 번 넘기거나
+  `xattr -dr com.apple.quarantine <파일>` 을 쓰세요.
+
+## 만들어지는 파일
+
+실행 파일 옆에 다음이 생깁니다.
+
+- `scrcpy_bin/` — 꺼내 둔 adb
+- `device_leases.json` — 누가 어느 기기를 쓰는 중인지
+- `device_aliases.json` — 기기 별칭
+- `macros/`, `logs/` — 녹화한 매크로, 저장한 logcat
+- `install-id.txt`, `dist-control-cache.json` — 아래 참고
+
+포트를 바꾸려면 `ws-scrcpy.config.json` 을 실행 파일 옆에 두면 그게 우선합니다.
+
+## 사용 확인에 대해 (숨기지 않고 적습니다)
+
+이 프로그램은 실행할 때와 6시간마다, 배포자가 관리하는 파일 하나를 읽어서 계속
+써도 되는지 확인합니다. 확인하는 주소와 이 설치본의 ID는 실행할 때 콘솔에
+표시되고, http://localhost:8001/api/health 에서도 볼 수 있습니다. 기기 정보나
+사용 내역을 보내지는 않습니다.
+
+네트워크가 안 되는 환경도 쓸 수 있게, 마지막 확인 결과로 **14일까지는** 그대로
+동작합니다.
 
 ## 팜을 밖으로 열 때
 
 기본은 인증이 없습니다. 접근할 수 있는 누구나 기기를 조작하고 APK를 설치할 수
-있습니다. 사내망 전용이면 그대로 두고, 밖으로 노출한다면 실행 스크립트 안의
-`DEVICE_FARM_TOKEN` 줄의 주석을 풀고 긴 임의 문자열을 넣으세요.
+있습니다. 사내망 전용이면 그대로 두고, 밖으로 노출한다면 실행 전에 토큰을
+설정하세요.
+
+    윈도우   set DEVICE_FARM_TOKEN=긴-임의-문자열
+    맥       export DEVICE_FARM_TOKEN=긴-임의-문자열
 
 자세한 내용은 프로젝트 README를 보세요.
 https://github.com/kimyeongseong/qa-device-farm
@@ -355,54 +292,13 @@ https://github.com/kimyeongseong/qa-device-farm
 
 
 def write_extras(app_dir, tag):
-    name = "시작하기.bat" if os.name == "nt" else "시작하기.command"
-    body = (LAUNCHER_BAT if os.name == "nt" else LAUNCHER_SH).replace("{app_name}", APP_NAME)
-    path = os.path.join(app_dir, name)
-    # 윈도우 배치 파일은 CRLF여야 안전합니다.
-    with open(path, "w", encoding="utf-8", newline="\r\n" if os.name == "nt" else "\n") as f:
-        f.write(body)
-    if os.name != "nt":
-        os.chmod(path, 0o755)
+    """실행 파일 옆에 둘 안내문과 라이선스.
 
+    실행 스크립트는 없습니다 -- 실행 파일 하나가 미러링 서버까지 직접 띄웁니다.
+    """
+    exe_name = APP_NAME + (".exe" if os.name == "nt" else "")
     with open(os.path.join(app_dir, "먼저-읽어주세요.txt"), "w", encoding="utf-8") as f:
-        f.write(READ_ME.replace("{tag}", tag))
-
-    # 사용자가 adb를 넣을 자리. 빈 폴더는 zip에 안 담기므로 안내문을 하나 둡니다.
-    tools = os.path.join(app_dir, "scrcpy_bin")
-    os.makedirs(tools, exist_ok=True)
-
-    # adbutils는 플랫폼에 따라 자기 adb를 들고 옵니다(윈도우는 있고 맥은 없습니다).
-    # 그걸 scrcpy_bin에 복사해 둬야 **ws-scrcpy가** 찾습니다 -- 그쪽은 adb를 PATH에서
-    # 찾아 실행하지, 팜처럼 경로를 해석하지 않습니다. 안 하면 대시보드와 기기 목록은
-    # 멀쩡한데 미러링만 "spawn adb ENOENT"로 죽습니다. 실제로 그렇게 나갔습니다.
-    # adb.exe 하나만 옮기면 안 됩니다. 윈도우 adb는 AdbWinApi.dll과
-    # AdbWinUsbApi.dll이 같은 폴더에 있어야 하고, 없으면 실행하자마자 종료 코드
-    # 3221225781(0xC0000135, DLL 없음)로 죽습니다. 실제로 그렇게 나갔습니다.
-    # 그래서 파일 하나가 아니라 binaries 폴더의 실행 파일과 DLL을 통째로 옮깁니다.
-    try:
-        from adbutils import adb_path
-        source_adb = adb_path()
-        if source_adb and os.path.exists(source_adb):
-            source_dir = os.path.dirname(source_adb)
-            copied = []
-            for entry in sorted(os.listdir(source_dir)):
-                if os.path.splitext(entry)[1].lower() in (".exe", ".dll", "") \
-                        and os.path.isfile(os.path.join(source_dir, entry)) \
-                        and not entry.endswith(".py") and entry != "README.md":
-                    shutil.copy2(os.path.join(source_dir, entry), os.path.join(tools, entry))
-                    copied.append(entry)
-            log(f"adbutils의 adb를 scrcpy_bin에 넣었습니다: {', '.join(copied)}")
-    except Exception as e:
-        log(f"adbutils adb를 넣지 못했습니다({e}) - 사용자가 직접 넣어야 합니다")
-    with open(os.path.join(tools, "여기에-adb를-넣으세요.txt"), "w", encoding="utf-8") as f:
-        f.write("Android platform-tools의 adb를 이 폴더에 넣으세요.\n"
-                "https://developer.android.com/tools/releases/platform-tools\n\n"
-                "소리까지 받으려면 scrcpy 2.7 이상도 같은 폴더에 넣으면 됩니다.\n"
-                "https://github.com/Genymobile/scrcpy/releases\n")
-
-    # 스트림 포트 설정은 실행 파일 옆에도 둡니다 — 배포본을 받은 사람이
-    # 포트를 바꾸려면 만질 수 있어야 합니다.
-    shutil.copy2(os.path.join(ROOT, "ws-scrcpy.config.json"), app_dir)
+        f.write(READ_ME.replace("{tag}", tag).replace("{exe_name}", exe_name))
 
     for doc in ("LICENSE", "NOTICE.md", "README.md"):
         source = os.path.join(ROOT, doc)
@@ -420,17 +316,28 @@ def main():
 
     tag = platform_tag()
     app_dir = os.path.join(OUT_DIR, f"{APP_NAME}-{tag}")
-    if os.path.exists(app_dir):
-        shutil.rmtree(app_dir)
+    staging = os.path.join(BUILD_DIR, "staging")
+    for path in (app_dir, staging):
+        if os.path.exists(path):
+            shutil.rmtree(path)
     os.makedirs(app_dir, exist_ok=True)
+    os.makedirs(staging, exist_ok=True)
 
     log(f"대상: {tag}")
-    build_server(app_dir)
+
+    # 미러링 서버를 먼저 모아 둡니다 -- EXE 안에 같이 들어가야 해서 빌드보다
+    # 앞서야 합니다.
     if not args.skip_node:
-        fetch_node(os.path.join(app_dir, "node"))
+        fetch_node(os.path.join(staging, "node"))
     if not args.skip_ws_scrcpy:
-        build_ws_scrcpy(app_dir)
+        build_ws_scrcpy(staging)
+
+    build_server(app_dir, staging)
     write_extras(app_dir, tag)
+
+    exe = os.path.join(app_dir, APP_NAME + (".exe" if os.name == "nt" else ""))
+    if os.path.exists(exe):
+        log(f"실행 파일: {exe} ({os.path.getsize(exe)/1048576:.0f}MB)")
 
     archive = shutil.make_archive(app_dir, "zip", root_dir=OUT_DIR,
                                   base_dir=os.path.basename(app_dir))

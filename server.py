@@ -11,11 +11,13 @@ import shutil
 import time
 import re
 import hmac
+import contextlib
 from pydantic import BaseModel
 
 # iOS 미러링은 맥 + phone-harness가 있을 때만 켜집니다. 임포트 자체는 어디서든
 # 되고(플랫폼 검사는 호출 시점), 없으면 iOS 경로만 503으로 막힙니다.
 import ios_mirror as ios
+import dist_control
 
 # This server echoes device output — logcat lines, app names, adb errors — and
 # those routinely carry characters the console codepage cannot encode (emoji on
@@ -79,7 +81,28 @@ def app_data(name: str) -> str:
     """A file the farm writes and must keep across restarts."""
     return os.path.join(APP_HOME, name) if FROZEN else name
 
+# 배포본 원격 차단 상태. 기동할 때 채워지고, 켜 둔 채로도 주기적으로 다시
+# 확인합니다 -- 팜은 며칠씩 켜 두는 물건이라 기동 때 한 번만 보면 차단이 한참 뒤에나
+# 먹습니다.
+CONTROL_STATE = {}
+
+# 통짜 EXE 배포본이 직접 띄운 미러링 서버. 종료할 때 같이 내리려고 들고 있습니다.
+bundled_stream_procs = []
+
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    """기동·종료 때 할 일.
+
+    on_event 대신 이걸 씁니다. 지원 중단 경고가 배포본 첫 화면에 세 덩어리
+    찍히는데, QA 담당자가 그걸 보면 고장으로 읽습니다.
+    """
+    await start_bundled_stream_server()
+    await start_control_recheck()
+    yield
+    await stop_bundled_stream_server()
+
 app = FastAPI(
+    lifespan=lifespan,
     title="QA Device Farm",
     description="Self-hosted Android device farm: shared real devices over one HTTP/WebSocket API.",
     version="1.2.0",
@@ -230,6 +253,116 @@ if not os.path.exists(STATIC_DIR):
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+async def start_bundled_stream_server():
+    """통짜 EXE로 배포했을 때 미러링 서버를 서버가 직접 띄웁니다.
+
+    소스로 돌 때는 사람이 `npm start`로 따로 띄웁니다(그게 개발할 때 편합니다).
+    배포본은 그럴 수 없습니다 -- 받는 사람이 실행하는 건 EXE 하나뿐이고, 배치
+    파일로 두 프로세스를 띄우게 하면 거기서부터 "왜 창이 두 개냐"가 시작됩니다.
+
+    Node와 ws-scrcpy는 EXE 안에 들어 있고, PyInstaller가 풀어 놓은 자리에서
+    그대로 실행합니다. adb는 그 전에 PATH에 올려 둬야 합니다 -- ws-scrcpy는
+    adb를 PATH에서 찾아 띄우기 때문입니다.
+    """
+    if not FROZEN:
+        return
+
+    node = os.path.join(BUNDLE_DIR, "node", "node.exe" if os.name == "nt" else "node")
+    entry = os.path.join(BUNDLE_DIR, "ws-scrcpy", "index.js")
+    if not (os.path.exists(node) and os.path.exists(entry)):
+        return  # Node를 빼고 만든 배포본. 간이 미러링은 그대로 됩니다.
+
+    if not os.name == "nt":
+        try:
+            os.chmod(node, 0o755)   # zip을 거치면 실행 권한이 날아갑니다.
+        except OSError:
+            pass
+
+    env = dict(os.environ)
+    env["WS_SCRCPY_CONFIG"] = STREAM_CONFIG_FILE
+    adb_dir = os.path.dirname(os.path.abspath(get_adb_path()))
+    if os.path.isdir(adb_dir):
+        env["PATH"] = adb_dir + os.pathsep + env.get("PATH", "")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            node, entry, env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
+    except Exception as e:
+        print(f"[stream] 미러링 서버를 띄우지 못했습니다: {e}")
+        print("[stream] 간이 미러링은 그대로 쓸 수 있습니다.")
+        return
+
+    bundled_stream_procs.append(proc)
+    print(f"[stream] 미러링 서버 시작 (포트 {get_stream_port()})", flush=True)
+
+    async def watch():
+        _, stderr = await proc.communicate()
+        if proc.returncode not in (0, None):
+            detail = stderr.decode("utf-8", errors="replace").strip()[-400:]
+            print(f"[stream] 미러링 서버가 종료됐습니다 (코드 {proc.returncode})")
+            if detail:
+                print(f"[stream] {detail}", flush=True)
+
+    asyncio.create_task(watch())
+
+async def stop_bundled_stream_server():
+    """팜을 닫으면 미러링 서버도 같이 내려가야 합니다. 남으면 포트를 쥡니다."""
+    for proc in bundled_stream_procs:
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+async def start_control_recheck():
+    """배포본이면 켜 둔 채로도 주기적으로 사용 가능 여부를 다시 확인합니다.
+
+    팜은 며칠씩 켜 두는 물건이라, 기동할 때 한 번만 보면 차단이 재부팅 전까지
+    먹지 않습니다. 차단으로 바뀌면 조작을 막고 콘솔에 사유를 찍습니다.
+    """
+    if not CONTROL_STATE:
+        return
+
+    async def loop():
+        while True:
+            await asyncio.sleep(dist_control.RECHECK_SECONDS)
+            state = await asyncio.to_thread(dist_control.evaluate, APP_HOME)
+            CONTROL_STATE.update(state)
+            if not state["allowed"]:
+                print("=" * 62)
+                print("  배포자가 이 프로그램의 사용을 중지했습니다.")
+                print(f"  {state['message']}")
+                print(f"  설치 ID {state['install_id']}")
+                print("=" * 62, flush=True)
+
+    asyncio.create_task(loop())
+
+def control_block_response():
+    """차단된 상태에서 조작 요청이 오면 돌려줄 응답. 허용이면 None."""
+    if CONTROL_STATE and CONTROL_STATE.get("allowed") is False:
+        return JSONResponse(
+            {"status": "error",
+             "message": CONTROL_STATE.get("message") or "사용이 중지되었습니다.",
+             "install_id": CONTROL_STATE.get("install_id")},
+            status_code=403)
+    return None
+
+@app.middleware("http")
+async def block_when_disabled(request: Request, call_next):
+    """차단되면 기기를 건드리는 요청을 막습니다.
+
+    대시보드와 health는 열어 둡니다 -- 사용자가 왜 안 되는지 보고 자기 설치 ID를
+    확인할 수 있어야 배포자에게 문의할 수 있습니다.
+    """
+    path = request.url.path
+    if not is_public_path(path) and path.startswith("/api/"):
+        blocked = control_block_response()
+        if blocked:
+            return blocked
+    return await call_next(request)
+
 @app.get("/")
 async def read_root():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
@@ -243,7 +376,18 @@ async def control_page():
 # separate ports, so the browser has to be told where the second one is. Both
 # sides read the same file so the port is defined exactly once.
 
-STREAM_CONFIG_FILE = bundled("ws-scrcpy.config.json")
+def _stream_config_path():
+    """스트림 설정 파일. 실행 파일 옆에 둔 것이 번들 안의 것을 이깁니다.
+
+    통짜 EXE는 설정이 안에 들어가 버려서 포트를 못 바꿉니다. 옆에 같은 이름으로
+    두면 그걸 쓰도록 해서, 8010이 이미 물려 있는 PC에서도 손댈 자리를 남깁니다.
+    """
+    beside = app_data("ws-scrcpy.config.json")
+    if FROZEN and os.path.exists(beside):
+        return beside
+    return bundled("ws-scrcpy.config.json")
+
+STREAM_CONFIG_FILE = _stream_config_path()
 FALLBACK_STREAM_PORT = 8010
 
 def get_stream_port() -> int:
@@ -278,6 +422,51 @@ def bundled_tool(name: str):
         if os.path.exists(candidate):
             return candidate
     return None
+
+def ensure_local_adb():
+    """번들 안의 adb를 실행 파일 옆 scrcpy_bin/으로 한 번 꺼내 놓습니다.
+
+    통짜 EXE는 실행할 때마다 임시 폴더에 풀리고 끝나면 지워집니다. 거기 있는
+    adb를 그대로 쓰면 두 가지가 꼬입니다. adb 서버가 그 임시 파일을 잡고 있어서
+    종료할 때 정리가 안 되고, 경로가 매번 바뀌어서 사용자가 "어느 adb를 쓰는지"
+    확인할 수도 없습니다. 고정된 자리로 옮겨 두면 둘 다 없어집니다.
+
+    adb.exe만 옮기면 안 됩니다 -- 윈도우 adb는 AdbWinApi.dll이 같은 폴더에
+    있어야 하고, 없으면 실행하자마자 0xC0000135로 죽습니다.
+    """
+    if not FROZEN:
+        return None
+
+    target_dir = os.path.join(APP_HOME, "scrcpy_bin")
+    exe = "adb.exe" if os.name == "nt" else "adb"
+    target = os.path.join(target_dir, exe)
+    if os.path.exists(target):
+        return target
+
+    try:
+        from adbutils import adb_path
+        source = adb_path()
+    except Exception:
+        return None
+    if not (source and os.path.exists(source)):
+        return None
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        source_dir = os.path.dirname(source)
+        for entry in sorted(os.listdir(source_dir)):
+            full = os.path.join(source_dir, entry)
+            if os.path.isfile(full) and os.path.splitext(entry)[1].lower() in (".exe", ".dll", ""):
+                if entry.endswith(".py") or entry == "README.md":
+                    continue
+                shutil.copy2(full, os.path.join(target_dir, entry))
+        if os.name != "nt" and os.path.exists(target):
+            os.chmod(target, 0o755)
+        print(f"[adb] 번들 adb를 {target_dir} 에 꺼내 두었습니다.")
+        return target if os.path.exists(target) else None
+    except Exception as e:
+        print(f"[adb] 번들 adb를 꺼내지 못했습니다: {e}")
+        return None
 
 def get_adb_path():
     """Locate the adb binary.
@@ -1768,6 +1957,12 @@ def check_health():
             # iOS는 있으면 좋고 없으면 그만인 부가 기능이라 status에 영향을
             # 주지 않습니다. 다만 왜 안 보이는지는 여기서 말합니다.
             "ios": ios.ios_status(),
+            # 배포본이면 이 설치본의 ID와 마지막 확인 결과. 사용자가 자기 ID를
+            # 알아야 배포자에게 문의할 수 있고, 숨길 이유도 없습니다.
+            "distribution": ({"install_id": CONTROL_STATE.get("install_id"),
+                              "checked_at": CONTROL_STATE.get("checked_at"),
+                              "source": CONTROL_STATE.get("source")}
+                             if CONTROL_STATE else None),
         }
     except Exception as e:
         return JSONResponse(
@@ -2542,6 +2737,31 @@ if __name__ == "__main__":
     port = int(os.environ.get("DEVICE_FARM_PORT", "8001"))
     stream_port = get_stream_port()
 
+    ensure_local_adb()
+
+    # 배포한 빌드는 배포자가 원격으로 멈출 수 있어야 합니다. 소스에서 돌릴 때는
+    # 검사하지 않습니다 -- 그쪽은 어차피 코드를 들고 있어서 통제할 수도 없고,
+    # 개발 중에 네트워크를 요구할 이유도 없습니다.
+    if FROZEN and os.environ.get("DEVICE_FARM_SKIP_CONTROL", "").strip() != "1":
+        state = dist_control.evaluate(APP_HOME)
+        if not state["allowed"]:
+            print("=" * 62)
+            print("  QA Device Farm - 실행할 수 없습니다")
+            print()
+            print(f"  {state['message']}")
+            print()
+            print(f"  설치 ID   {state['install_id']}")
+            print(f"  확인 위치 {dist_control.control_url()}")
+            print()
+            print("  배포자에게 문의하세요.")
+            print("=" * 62)
+            try:
+                input("계속하려면 Enter를 누르세요...")
+            except Exception:
+                pass
+            sys.exit(2)
+        CONTROL_STATE.update(state)
+
     if port_owner(host, port):
         print(f"[ERROR] Port {port} is already in use, so the dashboard cannot start.")
         print("        Something else is holding it. Find it with:")
@@ -2565,7 +2785,12 @@ if __name__ == "__main__":
     else:
         print(f"  Bound to    {host} (이 주소로만 접근됩니다)")
     print(f"  API docs    http://localhost:{port}/docs")
-    print(f"  Stream      port {stream_port} (ws-scrcpy, started separately)")
+    # 배포본은 미러링 서버를 이 프로세스가 직접 띄웁니다. 소스로 돌 때만 사람이
+    # 따로 `npm start` 해야 하므로, 둘을 구분해서 적습니다.
+    if FROZEN:
+        print(f"  Stream      port {stream_port} (ws-scrcpy, 같이 실행됩니다)")
+    else:
+        print(f"  Stream      port {stream_port} (ws-scrcpy, started separately)")
     adb_bin = adb_binary_info()
     print(f"  adb         {adb_bin['path']}")
     if not adb_bin["ok"]:

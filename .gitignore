@@ -16,6 +16,7 @@ build/out/
 build/work/
 build/spec/
 build/cache/
+build/staging/
 
 # Local runtime state (device serials, recorded macros, uploads)
 device_aliases.json

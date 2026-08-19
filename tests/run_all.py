@@ -27,6 +27,7 @@ SUITES = [
     ("test_ios_provider.py", "iOS pseudo-device, graceful degradation, android-only guards"),
     ("test_ios_scripts.py", "phone-harness script templates: signatures and coordinate conversion"),
     ("test_cli_harness.py", "harness script runner and skill generation"),
+    ("test_dist_control.py", "remote kill switch: verdicts, offline grace, cached blocks"),
 ]
 
 
