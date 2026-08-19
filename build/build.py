@@ -237,8 +237,18 @@ chcp 65001 >nul
 title QA Device Farm
 cd /d "%~dp0"
 
-:: 팜은 adb로 기기를 조작합니다. 여기 있는 것을 먼저 쓰고, 없으면 PATH에서 찾습니다.
-:: ws-scrcpy는 adb를 PATH에서 직접 실행하므로 두 서버가 같은 것을 보도록 맞춥니다.
+:: ws-scrcpy는 adb를 **PATH에서 찾아 프로세스로 띄웁니다**. 팜 서버처럼 경로를
+:: 스스로 해석하지 않기 때문에, adb가 PATH에 없으면 대시보드와 기기 목록은 멀쩡한데
+:: 미러링만 "spawn adb ENOENT"로 죽습니다.
+::
+:: 번들에는 adbutils가 들고 온 adb.exe가 들어 있지만 _internal 안이라 PATH에
+:: 안 잡힙니다. scrcpy_bin이 비어 있으면 그걸 한 번 복사해 둡니다.
+if not exist "%~dp0scrcpy_bin\\adb.exe" (
+  if exist "%~dp0{app_name}\\_internal\\adbutils\\binaries\\adb.exe" (
+    echo 번들 adb를 scrcpy_bin으로 복사합니다...
+    copy /y "%~dp0{app_name}\\_internal\\adbutils\\binaries\\adb.exe" "%~dp0scrcpy_bin\\" >nul
+  )
+)
 if exist "%~dp0scrcpy_bin\\adb.exe" set "PATH=%~dp0scrcpy_bin;%PATH%"
 
 :: 스트림 포트는 이 파일 한 곳에서만 정의합니다.
@@ -333,6 +343,19 @@ def write_extras(app_dir, tag):
     # 사용자가 adb를 넣을 자리. 빈 폴더는 zip에 안 담기므로 안내문을 하나 둡니다.
     tools = os.path.join(app_dir, "scrcpy_bin")
     os.makedirs(tools, exist_ok=True)
+
+    # adbutils는 플랫폼에 따라 자기 adb를 들고 옵니다(윈도우는 있고 맥은 없습니다).
+    # 그걸 scrcpy_bin에 복사해 둬야 **ws-scrcpy가** 찾습니다 -- 그쪽은 adb를 PATH에서
+    # 찾아 실행하지, 팜처럼 경로를 해석하지 않습니다. 안 하면 대시보드와 기기 목록은
+    # 멀쩡한데 미러링만 "spawn adb ENOENT"로 죽습니다. 실제로 그렇게 나갔습니다.
+    try:
+        from adbutils import adb_path
+        source_adb = adb_path()
+        if source_adb and os.path.exists(source_adb):
+            shutil.copy2(source_adb, os.path.join(tools, os.path.basename(source_adb)))
+            log(f"adbutils의 adb를 scrcpy_bin에 넣었습니다: {os.path.basename(source_adb)}")
+    except Exception as e:
+        log(f"adbutils adb를 넣지 못했습니다({e}) - 사용자가 직접 넣어야 합니다")
     with open(os.path.join(tools, "여기에-adb를-넣으세요.txt"), "w", encoding="utf-8") as f:
         f.write("Android platform-tools의 adb를 이 폴더에 넣으세요.\n"
                 "https://developer.android.com/tools/releases/platform-tools\n\n"
