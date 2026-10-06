@@ -13,6 +13,8 @@ import re
 import hmac
 from pydantic import BaseModel
 
+import virtual_devices as vd
+
 # This server echoes device output — logcat lines, app names, adb errors — and
 # those routinely carry characters the console codepage cannot encode (emoji on
 # a cp949 Windows console). An unencodable print raises UnicodeEncodeError from
@@ -572,12 +574,21 @@ def read_static_detail(d):
             width, height = int(w), int(h)
     except Exception:
         pass
+    # Which AVD an emulator is running. Read once with the rest of this dict,
+    # and only for emulator serials so a real phone pays no extra round trip.
+    avd = None
+    if vd.is_emulator_serial(d.serial):
+        avd = (d.prop.get("ro.boot.qemu.avd_name")
+               or d.prop.get("ro.kernel.qemu.avd_name")
+               or vd.avd_name_for(d.serial))
     return {
         "model": model,
         "version": d.prop.get("ro.build.version.release", "?"),
         "sdk": d.prop.get("ro.build.version.sdk", "?"),
         "width": width,
         "height": height,
+        "virtual": vd.is_emulator_serial(d.serial),
+        "avd": avd or None,
     }
 
 def read_battery(d):
@@ -676,8 +687,9 @@ def collect_devices(refresh: bool):
                 width, height = detail["width"], detail["height"]
                 ip, battery = detail["ip"], detail["battery"]
 
-                # Alias Lookup
-                alias = device_aliases.get(d.serial, model)
+                # Alias Lookup. An emulator's model is "sdk_gphone64_x86_64"
+                # whatever it emulates, so its AVD name says far more.
+                alias = device_aliases.get(d.serial, detail.get("avd") or model)
 
                 # Lease Lookup
                 lease = get_lease(d.serial)
@@ -692,6 +704,8 @@ def collect_devices(refresh: bool):
                     "sdk": sdk,
                     "battery": battery,
                     "alias": alias,
+                    "virtual": detail.get("virtual", False),
+                    "avd": detail.get("avd"),
                     "state": "device",
                     "state_hint": None,
                     "occupied_by": lease["owner"] if lease else None,
@@ -710,6 +724,8 @@ def collect_devices(refresh: bool):
                     "version": "?", "width": 0, "height": 0,
                     "ip": "?", "sdk": "?", "battery": "?",
                     "alias": device_aliases.get(d.serial, d.serial),
+                    "virtual": vd.is_emulator_serial(d.serial),
+                    "avd": vd.avd_name_for(d.serial),
                     "state": "error",
                     "state_hint": f"기기 정보를 읽지 못했습니다: {e}",
                     "occupied_by": None, "occupied_until": None
@@ -719,14 +735,22 @@ def collect_devices(refresh: bool):
         for serial, state in states.items():
             if serial in online:
                 continue
+            virtual = vd.is_emulator_serial(serial)
+            hint = STATE_LABELS.get(state, f"사용 불가 상태: {state}")
+            if virtual and state == "offline":
+                # Not a bad cable: adb lists an emulator as offline until
+                # Android has booted far enough to answer.
+                hint = "에뮬레이터 부팅 중"
             devices.append({
                 "serial": serial,
                 "model": device_aliases.get(serial, serial),
                 "version": "?", "width": 0, "height": 0,
                 "ip": "?", "sdk": "?", "battery": "?",
-                "alias": device_aliases.get(serial, serial),
+                "alias": device_aliases.get(serial, vd.avd_name_for(serial) or serial),
+                "virtual": virtual,
+                "avd": vd.avd_name_for(serial),
                 "state": state,
-                "state_hint": STATE_LABELS.get(state, f"사용 불가 상태: {state}"),
+                "state_hint": hint,
                 "occupied_by": None, "occupied_until": None
             })
 
@@ -1007,6 +1031,17 @@ async def reset_stream(serial: str):
 class OccupyRequest(BaseModel):
     owner: str
     ttl_seconds: int = DEFAULT_LEASE_SECONDS
+    # Only for "any free device": "physical" or "virtual" narrows the pick.
+    # A crash that needs real hardware should not land on an emulator, and a
+    # smoke run that any Android will do should not tie up a scarce phone.
+    kind: str = None
+
+DEVICE_KINDS = ("physical", "virtual")
+
+def kind_matches(serial: str, kind) -> bool:
+    if not kind:
+        return True
+    return vd.is_emulator_serial(serial) == (kind == "virtual")
 
 class ReleaseRequest(BaseModel):
     owner: str
@@ -1028,10 +1063,15 @@ async def occupy_device(serial: str, req: OccupyRequest):
 @app.post("/api/devices/occupy")
 async def occupy_any_device(req: OccupyRequest):
     """Claim any free device. This is what a CI job calls when it just needs 'an Android'."""
+    if req.kind and req.kind not in DEVICE_KINDS:
+        return JSONResponse({"status": "error",
+                             "message": f"Invalid kind: {req.kind!r} (expected one of {list(DEVICE_KINDS)})"},
+                            status_code=400)
     try:
         serials = drop_duplicate_transports([d.serial for d in adb.device_list()])
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+    serials = [s for s in serials if kind_matches(s, req.kind)]
 
     for serial in serials:
         if get_lease(serial) is None:
@@ -1137,6 +1177,7 @@ def check_health():
             "adb": "ok",
             "devices_total": len(serials),
             "devices_free": len(serials) - leased,
+            "devices_virtual": sum(1 for s in serials if vd.is_emulator_serial(s)),
             "devices_unusable": len(unusable),
             "unusable": unusable,
             "adb_path": binary["path"],
@@ -1148,6 +1189,9 @@ def check_health():
             # connection dies with it. That failure is invisible from the client
             # path alone, so surface what is actually answering on port 5037.
             "adb_server": adb_server_info(),
+            # Emulator support is optional, so a missing SDK never makes the
+            # farm "degraded" -- it is reported, not alarmed on.
+            "virtual": vd.sdk_info(),
         }
     except Exception as e:
         return JSONResponse(
@@ -1775,6 +1819,238 @@ async def batch_install(serials: str = Form(...), owner: str = Form(None),
     finally:
         if os.path.exists(temp_file):
             os.remove(temp_file)
+
+
+# --- Virtual Devices (Android emulators) ---
+# The SDK work lives in virtual_devices.py. What is here is the farm's side of
+# it: leases, the device cache, and turning a started emulator into a serial
+# the caller can drive straight away. Once booted, an emulator is an ordinary
+# adb device and every other endpoint in this file works on it unchanged.
+
+def vd_error(e: "vd.VirtualDeviceError"):
+    return JSONResponse({"status": "error", "message": str(e)}, status_code=e.status)
+
+def avd_snapshot():
+    """Current AVDs with their lifecycle state. Blocking: call through a thread."""
+    states = list_device_states()
+    running = vd.running_emulators(get_adb_path(), list(states))
+    avds = []
+    for avd in vd.list_avds():
+        entry = {**avd, **vd.status_of(avd, running, states)}
+        lease = get_lease(entry["serial"]) if entry["serial"] else None
+        entry["occupied_by"] = lease["owner"] if lease else None
+        entry["occupied_until"] = lease["expires_at"] if lease else None
+        avds.append(entry)
+    return avds, states
+
+def forget_emulator_serial(serial: str):
+    """Drop farm state tied to an emulator-<port> serial.
+
+    That serial names a console port, not a device. The next AVD started on
+    the port gets the same serial, so a lease, cached detail or boot flag
+    left behind would be inherited by a different emulator -- a lease in
+    particular would lock somebody out of a device they just booted.
+    """
+    if device_leases.pop(lease_key(serial), None) is not None:
+        save_leases()
+    device_cache.pop(serial, None)
+    vd.forget_serial(serial)
+
+@app.get("/api/avds")
+async def list_avds():
+    """AVDs defined on this host, each with status stopped / starting / booting / running / failed."""
+    try:
+        avds, _ = await asyncio.to_thread(avd_snapshot)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+    return {"status": "success", "sdk": vd.sdk_info(), "avds": avds}
+
+@app.get("/api/sdk/system-images")
+async def list_system_images():
+    """Installed system images -- what a new AVD can be built from."""
+    return {"status": "success", "images": await asyncio.to_thread(vd.list_system_images)}
+
+@app.get("/api/sdk/device-profiles")
+async def list_device_profiles():
+    """Hardware profiles (pixel_6, pixel_tablet, ...) avdmanager can give a new AVD."""
+    try:
+        return {"status": "success", "profiles": await asyncio.to_thread(vd.list_device_profiles)}
+    except vd.VirtualDeviceError as e:
+        return vd_error(e)
+
+class AvdCreateRequest(BaseModel):
+    name: str
+    image: str                  # e.g. system-images;android-34;google_apis;x86_64
+    device: str = None          # hardware profile id; avdmanager's default if omitted
+
+@app.post("/api/avds")
+async def create_avd(req: AvdCreateRequest):
+    try:
+        avd = await asyncio.to_thread(vd.create_avd, req.name, req.image, req.device)
+    except vd.VirtualDeviceError as e:
+        return vd_error(e)
+    print(f"AVD created: {req.name} ({req.image})")
+    return {"status": "success", "avd": avd}
+
+def find_avd_status(name: str):
+    avds, states = avd_snapshot()
+    return next((a for a in avds if a["name"] == name), None), states
+
+ACTIVE_AVD_STATES = ("starting", "booting", "running")
+
+@app.delete("/api/avds/{name}")
+async def delete_avd(name: str):
+    try:
+        vd.check_avd_name(name)
+        avd, _ = await asyncio.to_thread(find_avd_status, name)
+        if avd and avd["status"] in ACTIVE_AVD_STATES:
+            return JSONResponse({"status": "error",
+                                 "message": f"'{name}' is {avd['status']}; stop it before deleting"},
+                                status_code=409)
+        await asyncio.to_thread(vd.delete_avd, name)
+    except vd.VirtualDeviceError as e:
+        return vd_error(e)
+    vd.launched.pop(name, None)
+    print(f"AVD deleted: {name}")
+    return {"status": "success", "deleted": name}
+
+class AvdStartRequest(BaseModel):
+    headless: bool = True       # -no-window: the farm is used through the browser
+    wipe: bool = False          # -wipe-data: factory-reset before boot
+    cold_boot: bool = False     # -no-snapshot-load: full boot instead of quick boot
+    gpu: str = None             # auto / host / swiftshader_indirect / angle_indirect / guest
+    wait: bool = False          # answer only once Android has finished booting
+    timeout: int = 300          # seconds to wait for boot when wait is set
+    # Claim the new emulator in the same call, so nobody can take it between
+    # "it booted" and "I leased it".
+    owner: str = None
+    ttl_seconds: int = DEFAULT_LEASE_SECONDS
+
+async def wait_for_boot(name: str, serial: str, timeout: int):
+    """Poll until the emulator reports sys.boot_completed. Returns the final state."""
+    deadline = time.time() + max(1, timeout)
+    while time.time() < deadline:
+        entry = vd.launched.get(name)
+        if entry is not None and entry["proc"].poll() is not None:
+            return "failed"
+        states = await asyncio.to_thread(list_device_states)
+        if states.get(serial) == "device" and await asyncio.to_thread(vd.is_booted, serial):
+            return "running"
+        await asyncio.sleep(vd.BOOT_POLL)
+    return "timeout"
+
+@app.post("/api/avds/{name}/start")
+async def start_avd(name: str, req: AvdStartRequest = AvdStartRequest()):
+    try:
+        vd.check_avd_name(name)
+        avd, states = await asyncio.to_thread(find_avd_status, name)
+        if not avd:
+            return JSONResponse({"status": "error", "message": f"No AVD named '{name}'"},
+                                status_code=404)
+        if avd["broken"]:
+            return JSONResponse({"status": "error",
+                                 "message": f"'{name}' has no readable config.ini at {avd['path']}"},
+                                status_code=409)
+
+        if avd["status"] in ACTIVE_AVD_STATES:
+            # Starting what is already up is a no-op, but the caller still gets
+            # the serial -- and a lease if it asked and the device is free.
+            serial = avd["serial"] or vd.launched.get(name, {}).get("serial")
+            lease = None
+            if req.owner and serial:
+                conflict = lease_conflict(serial, req.owner)
+                if conflict:
+                    return conflict
+                lease = grant_lease(serial, OccupyRequest(owner=req.owner, ttl_seconds=req.ttl_seconds))
+            return {"status": "success", "already_running": True, "name": name,
+                    "serial": serial, "state": avd["status"], "lease": lease}
+
+        emulator = vd.emulator_binary()
+        if not emulator:
+            return JSONResponse({"status": "error", "message": vd.sdk_info()["note"]},
+                                status_code=503)
+
+        port = await asyncio.to_thread(vd.pick_port, set(states))
+        cmd = vd.build_command(emulator, name, port, headless=req.headless, wipe=req.wipe,
+                               cold_boot=req.cold_boot, gpu=req.gpu)
+        serial = f"emulator-{port}"
+        forget_emulator_serial(serial)
+        entry = await asyncio.to_thread(vd.launch, name, port, cmd)
+    except vd.VirtualDeviceError as e:
+        return vd_error(e)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+    print(f"[{serial}] Starting AVD {name}: {' '.join(cmd)}")
+
+    await asyncio.sleep(vd.EARLY_EXIT_GRACE)
+    code = entry["proc"].poll()
+    if code is not None:
+        vd.launched.pop(name, None)
+        return JSONResponse({
+            "status": "error",
+            "message": f"Emulator exited immediately (code {code}). See the log below or {entry['log']}.",
+            "log": vd.log_tail(entry["log"]),
+        }, status_code=500)
+
+    lease = None
+    if req.owner:
+        lease = grant_lease(serial, OccupyRequest(owner=req.owner, ttl_seconds=req.ttl_seconds))
+
+    body = {"status": "success", "name": name, "serial": serial, "port": port,
+            "state": "starting", "log": entry["log"], "lease": lease}
+    if not req.wait:
+        return body
+
+    state = await wait_for_boot(name, serial, req.timeout)
+    body["state"] = state
+    if state == "running":
+        print(f"[{serial}] AVD {name} booted in {time.time() - entry['started']:.0f}s")
+        return body
+    body["status"] = "error"
+    if state == "failed":
+        body["message"] = f"Emulator exited during boot (code {entry['proc'].poll()})"
+        body["log"] = vd.log_tail(entry["log"])
+        vd.launched.pop(name, None)
+        return JSONResponse(body, status_code=500)
+    # Still booting: leave it running. The caller can keep polling /api/avds
+    # or stop it -- killing it here would throw away a boot that may be seconds
+    # from finishing.
+    body["message"] = f"Not booted after {req.timeout}s; still starting"
+    return JSONResponse(body, status_code=504)
+
+class AvdStopRequest(BaseModel):
+    owner: str = None
+
+@app.post("/api/avds/{name}/stop")
+async def stop_avd(name: str, req: AvdStopRequest = AvdStopRequest()):
+    try:
+        vd.check_avd_name(name)
+        avd, _ = await asyncio.to_thread(find_avd_status, name)
+    except vd.VirtualDeviceError as e:
+        return vd_error(e)
+
+    if not avd and name not in vd.launched:
+        return JSONResponse({"status": "error", "message": f"No AVD named '{name}'"},
+                            status_code=404)
+    status = avd["status"] if avd else "starting"
+    serial = avd["serial"] if avd else None
+    if status not in ACTIVE_AVD_STATES:
+        vd.launched.pop(name, None)     # also clears a 'failed' entry
+        return {"status": "success", "message": "Not running", "name": name}
+
+    # Shutting an emulator down ends whatever test is on it, so it is held to
+    # the same rule as `pm clear`.
+    if serial:
+        conflict = lease_conflict(serial, req.owner)
+        if conflict:
+            return conflict
+
+    await asyncio.to_thread(vd.stop, name, serial, get_adb_path())
+    if serial:
+        forget_emulator_serial(serial)
+    print(f"[{serial or name}] AVD {name} stopped")
+    return {"status": "success", "name": name, "serial": serial}
 
 
 active_audio_procs = {} # { serial: subprocess_obj }

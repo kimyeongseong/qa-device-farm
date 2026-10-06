@@ -42,6 +42,7 @@ QA 업무 중 실기기가 개인 PC에 묶여 있어서 생기던 문제 — �
 | **무선 디버깅 전환** | 버튼 한 번으로 `tcpip 5555` + `connect`. USB를 뽑아도 유지. |
 | **오디오 포워딩** | scrcpy 바이너리로 기기 소리를 PC로. |
 | **Picture-in-Picture** | 미러링 화면을 항상 위에 뜨는 작은 창으로. 다른 창에서 작업하면서 기기를 계속 보거나, 여러 대를 동시에 띄워둘 수 있습니다. |
+| **가상 기기 (에뮬레이터)** | Android SDK의 AVD를 대시보드·API에서 생성·부팅·종료. 켜진 에뮬레이터는 실기기와 똑같이 점유·조작·logcat·매크로·배치 대상이 됩니다. 선반에 없는 OS 버전·화면 크기를 바로 띄울 수 있습니다. |
 | **CLI / CI 연동** | 세션 개념 없이 HTTP 호출만으로 기기 점유 → 조작 → 로그 확인 → 반납. |
 
 ---
@@ -197,6 +198,53 @@ http://localhost:8001/control?serial=<serial>&model=<model>
 Node·npm 설치가 어려운 환경, 또는 ws-scrcpy가 죽었을 때의 대체 경로로 쓰세요.
 대시보드 기기 카드의 **[간이 미러링]** 버튼으로 바로 열 수 있습니다.
 
+### 가상 기기 (에뮬레이터)
+
+실기기는 대수가 정해져 있고, 버그 리포트에 적힌 OS 버전·화면 크기는 늘 선반에 없습니다.
+팜이 Android SDK의 에뮬레이터(AVD)를 직접 띄우고 내려서 그 빈자리를 채웁니다.
+
+**필요한 것:** Android SDK의 `emulator` 패키지와 시스템 이미지 하나 이상, 그리고 하드웨어 가속
+(Windows는 WHPX/Hyper-V, Linux는 KVM, mac은 Hypervisor.framework). AVD를 팜에서 **만들고 지우려면**
+`avdmanager`(Android SDK Command-line Tools)와 Java가 추가로 필요합니다. Android Studio로 이미 만든
+AVD를 켜고 끄는 것만이라면 필요 없습니다.
+
+SDK는 `ANDROID_HOME` → `ANDROID_SDK_ROOT` → OS별 Android Studio 기본 위치 → PATH의 adb가 들어 있는 SDK
+순으로 찾고, AVD는 `ANDROID_AVD_HOME`(없으면 `~/.android/avd`)에서 읽습니다. 찾은 경로는
+`GET /api/health`의 `virtual`에 나옵니다. SDK가 없어도 팜은 `ok`이고, 가상 기기 기능만 이유와 함께 꺼집니다.
+
+대시보드 상단의 **[＋ 가상 기기]**에서 AVD 목록·상태(중지됨/시작 중/부팅 중/실행 중/실패)를 보고
+시작·종료·삭제하거나 새로 만듭니다. 부팅이 끝난 에뮬레이터는 `emulator-5554` 같은 시리얼로 기기 그리드에
+`VIRTUAL` 표시와 함께 나타나며, 그때부터는 실기기와 구분 없이 미러링·점유·입력·logcat·매크로·배치가 됩니다.
+
+```bash
+python cli.py avd-images                     # 설치된 시스템 이미지
+python cli.py avd-create --name Pixel_6_API_34 \
+    --image "system-images;android-34;google_apis;x86_64" --device pixel_6
+python cli.py avds                           # AVD 목록과 상태
+
+# 부팅이 끝날 때까지 기다렸다가, 같은 호출로 점유까지
+python cli.py avd-start --name Pixel_6_API_34 --wait --owner ci-smoke
+python cli.py avd-stop  --name Pixel_6_API_34 --owner ci-smoke
+
+# 실기기/에뮬레이터 중 하나만 골라 잡기
+python cli.py occupy --owner ci-smoke --kind virtual
+```
+
+동작 방식에서 알아둘 것:
+
+- **매번 같은 상태에서 시작합니다.** `-no-snapshot-save`로 띄워서 지난 실행이 남긴 상태가 다음 실행으로 넘어가지
+  않습니다. 공장 초기화가 필요하면 **[초기화 후 시작]**(`wipe: true`), 스냅샷 없이 완전 부팅은 `cold_boot: true`.
+- **창 없이(headless) 뜹니다.** 팜은 브라우저로 쓰니까요. 호스트에서 창을 보려면 `--window`(`headless: false`).
+- **시리얼은 시작 즉시 정해집니다.** 콘솔 포트(5554~5682 짝수)를 팜이 골라 넘기기 때문에, 시작 응답에
+  `serial`이 바로 옵니다. 부팅을 기다리는 동안 목록에서 어느 기기가 내 것인지 추측할 필요가 없습니다.
+- **에뮬레이터 시리얼은 기기가 아니라 포트 이름입니다.** 다음에 같은 포트로 뜨는 건 다른 AVD일 수 있어서,
+  종료하거나 그 포트로 새로 시작할 때 `emulator-<port>`에 걸린 점유·캐시를 지웁니다.
+- **종료도 점유를 따릅니다.** 남이 잡고 있는 에뮬레이터는 `409`로 거절합니다 — 진행 중인 테스트가 통째로 끊기니까요.
+- **서버를 재시작해도 에뮬레이터는 살아 있습니다.** 별도 세션/프로세스 그룹으로 띄워서 `Ctrl+C`가 전파되지 않습니다.
+  재시작 뒤에도 adb(`emu avd name`)로 어느 AVD가 돌고 있는지 다시 알아냅니다.
+- **바로 죽으면 바로 알려줍니다.** 하드웨어 가속 없음·엔진 누락 같은 흔한 실패는 1~2초 안에 프로세스가 끝나므로,
+  시작 응답이 에뮬레이터 로그 마지막 줄과 함께 실패를 돌려줍니다. 전체 로그는 `logs/emulator_<AVD>.log`.
+
 기기 별칭을 미리 넣어두려면 `device_aliases.example.json`을 `device_aliases.json`으로 복사해서 편집하세요. 이 파일은 실기기 시리얼이 들어가므로 gitignore되어 있습니다.
 
 ---
@@ -273,7 +321,7 @@ python cli.py batch-macro --serials R3CN30ABCDE,HA1EJ0000 --name login_flow --co
 | `GET` | `/api/devices` | 기기 목록 (점유 상태 + `state`/`state_hint`). `?refresh=1` 로 캐시 무시 |
 | `GET` | `/api/device/{serial}/screenshot` | JPEG 스크린샷 |
 | `GET` | `/api/info/{serial}` | 상세 정보 (제조사·CPU·현재 앱·IP) |
-| `POST` | `/api/devices/occupy` | 유휴 기기 아무거나 점유 |
+| `POST` | `/api/devices/occupy` | 유휴 기기 아무거나 점유 (`kind`: `physical` / `virtual`로 한정 가능) |
 | `POST` | `/api/device/{serial}/occupy` | 특정 기기 점유 |
 | `POST` | `/api/device/{serial}/release` | 반납 |
 | `GET` | `/api/leases` | 현재 점유 현황 |
@@ -302,6 +350,13 @@ python cli.py batch-macro --serials R3CN30ABCDE,HA1EJ0000 --name login_flow --co
 | `POST` | `/api/batch/app` | 여러 기기에 앱 제어 |
 | `POST` | `/api/batch/macro` | 여러 기기에 매크로 재생 |
 | `POST` | `/api/batch/install` | 여러 기기에 APK 설치 |
+| `GET` | `/api/avds` | AVD 목록 + 상태(`stopped`/`starting`/`booting`/`running`/`failed`)·시리얼·점유자 |
+| `POST` | `/api/avds` | AVD 생성 (`name`, `image`, `device`) — avdmanager 필요 |
+| `DELETE` | `/api/avds/{name}` | AVD 삭제 (실행 중이면 409) |
+| `POST` | `/api/avds/{name}/start` | 에뮬레이터 시작 (`wait`, `timeout`, `wipe`, `cold_boot`, `headless`, `gpu`, `owner`) |
+| `POST` | `/api/avds/{name}/stop` | 에뮬레이터 종료 (점유 강제) |
+| `GET` | `/api/sdk/system-images` | 설치된 시스템 이미지 |
+| `GET` | `/api/sdk/device-profiles` | 하드웨어 프로필 (`pixel_6` 등) |
 | `WS` | `/ws/video/{serial}` | screenrecord H.264 스트림 |
 | `WS` | `/ws/control/{serial}` | 실시간 입력 채널 |
 
@@ -352,8 +407,9 @@ python tests/run_all.py
 test_leases_and_input.py     ok       26 passed, 0 failed
 test_features.py             ok      194 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
-test_cli.py                  ok       24 passed, 0 failed
-259 passed, 0 failed across 4 suites
+test_virtual_devices.py      ok       86 passed, 0 failed
+test_cli.py                  ok       29 passed, 0 failed
+350 passed, 0 failed across 5 suites
 ```
 
 각 스위트는 별도 프로세스에서 임시 디렉터리를 cwd로 잡고 돌기 때문에, 서로의 monkeypatch나
@@ -362,13 +418,15 @@ test_cli.py                  ok       24 passed, 0 failed
 무엇을 덮는지: 점유 충돌·TTL 만료·풀 고갈, 입력 인젝션 차단, 매크로 해상도 스케일링과 v1 호환,
 경로 탈출 차단, 앱 제어 argv, 크래시 패턴 매칭, logcat 죽은 세션 복구와 파일 저장, 배치 부분 실패 격리,
 무선 시리얼 4종, 기기 정보 캐시, lease 영속화, 접근 토큰 경계, 잔존 스트림 프로세스 선별 종료,
+에뮬레이터 수명주기(가짜 SDK 디렉터리와 가짜 에뮬레이터 프로세스로 생성·시작·부팅·조기 실패·종료·포트 재사용),
 CLI 전 서브커맨드.
 
 `cli.py`는 실제 서브프로세스로 띄워 검증합니다 — 인프로세스 테스트로는 못 잡는 인자 처리 버그가
 실제로 있었기 때문입니다.
 
 **기기가 있어야만 되는 것**은 자동화하지 않았습니다: 미러링 화질·지연, 오디오, 실제 크래시 감지,
-무선 전환. 이건 실기기로 수동 확인했습니다.
+무선 전환. 이건 실기기로 수동 확인했습니다. 실제 Android 에뮬레이터 부팅도 마찬가지로, 테스트는 SDK가
+없는 환경에서 가짜 에뮬레이터로 돕니다.
 
 ---
 
@@ -397,4 +455,5 @@ CLI 전 서브커맨드.
 - **한글·이모지 입력이 안 됩니다.** `adb shell input text`가 ASCII만 받습니다. 기기에 별도 IME를 붙여야 합니다.
 - **매크로는 여전히 좌표 기반입니다.** 해상도 차이는 비례 스케일링으로 보정하지만, 화면비가 다르거나 레이아웃 자체가 바뀌는 기기(폴더블, 태블릿)에서는 어긋납니다. UI 요소를 찾아 누르는 방식이 아닙니다. 녹화 전에 저장된 v1 매크로는 해상도 정보가 없어 스케일 없이 재생됩니다.
 - **메모리 로그 버퍼는 기기당 2만 줄입니다.** 넘치면 오래된 줄부터 버려지고 서버 재시작 시 사라집니다. 생각보다 빨리 찹니다 — 레벨 V로 앱이 돌고 있는 태블릿에서 실측 초당 400~1,000줄, 즉 **30초~1분이면 한 바퀴**입니다. 가득 차면 로그 탭이 `버퍼 가득 · 오래된 로그 삭제 중`을 띄우지만, 재현이 길면 처음부터 `to_file`(대시보드의 '파일로 저장')을 켜세요 — `logs/` 에 전체가 남습니다.
+- **에뮬레이터는 팜 호스트의 자원을 씁니다.** 한 대에 RAM 2~4GB와 CPU 코어 몇 개가 들고, 하드웨어 가속이 없으면 시작 자체가 안 됩니다. 동시에 몇 대까지 띄울지는 호스트 사양이 정합니다 — 팜이 따로 상한을 두지 않습니다. 시스템 이미지 설치(`sdkmanager`)도 팜이 하지 않습니다. 수 GB 다운로드라서 호스트 관리자가 할 일로 남겨뒀습니다.
 - **PiP는 Chromium 계열에서만 됩니다.** Firefox는 이 API가 없어서 버튼이 아예 나타나지 않습니다. 브라우저 정책상 사용자가 직접 클릭해야 진입합니다(스크립트 클릭으로는 안 됩니다).

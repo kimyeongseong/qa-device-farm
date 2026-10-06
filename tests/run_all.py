@@ -22,6 +22,7 @@ SUITES = [
     ("test_leases_and_input.py", "leases, lease conflicts, TTL, input validation"),
     ("test_features.py", "macros, app control, logcat, batch, cache, wireless serials"),
     ("test_edge_cases.py", "dead capture recovery, corrupt files, odd serials"),
+    ("test_virtual_devices.py", "emulators: AVD discovery, start/stop, leases, kind filter"),
     ("test_cli.py", "cli.py driven as a real subprocess"),
 ]
 
