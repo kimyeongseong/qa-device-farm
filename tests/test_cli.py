@@ -12,6 +12,8 @@ WORK = tempfile.mkdtemp(prefix="farm_cli_")
 shutil.copytree(os.path.join(ROOT, "static"), os.path.join(WORK, "static"))
 os.makedirs(os.path.join(WORK, "macros"), exist_ok=True)
 os.chdir(WORK)
+# An empty AVD directory, so `avds` does not read whatever is on this machine.
+os.environ["ANDROID_AVD_HOME"] = os.path.join(WORK, "avd")
 
 import server
 import uvicorn
@@ -96,6 +98,21 @@ check("intruder's tap never reached adb", calls() == [], str(calls()))
 rc, out, _ = run("tap", "--serial", "CLI_A", "--x", "1", "--y", "1", "--owner", "ci-a")
 check("cli tap by owner exits 0", rc == 0, out[:160])
 run("release", "--serial", "CLI_A", "--owner", "ci-a")
+
+print()
+print("=== emulators: kind filter and AVD commands ===")
+rc, out, _ = run("occupy", "--owner", "ci-k", "--kind", "virtual")
+check("occupy --kind virtual with only a phone attached exits 1", rc == 1, out[:160])
+rc, out, _ = run("occupy", "--owner", "ci-k", "--kind", "physical")
+check("occupy --kind physical takes the phone",
+      rc == 0 and json.loads(out).get("serial") == "CLI_A", out[:160])
+run("release", "--serial", "CLI_A", "--owner", "ci-k")
+rc, out, err = run("avds")
+check("cli avds exits 0", rc == 0 and "Traceback" not in err, f"rc={rc} {err.strip()[:160]}")
+check("cli avds prints the AVD list", "avds" in json.loads(out), out[:160])
+rc, out, _ = run("avd-start", "--name=-bad")
+check("cli avd-start refuses an option-looking name",
+      rc == 1 and "Invalid AVD name" in out, out[:160])
 
 print()
 print("=== recording captures HTTP-driven input (was silently empty) ===")

@@ -11,6 +11,18 @@
 
 ### 추가 (Added)
 
+- **가상 기기 (Android 에뮬레이터)** — SDK의 AVD를 팜에서 생성·부팅·종료합니다. 대시보드 상단
+  [＋ 가상 기기], `/api/avds*`·`/api/sdk/*` API, `cli.py avd-*` 명령. 부팅된 에뮬레이터는
+  `emulator-<port>`로 기기 그리드에 `VIRTUAL` 표시와 함께 나타나 실기기와 똑같이 점유·조작·logcat·
+  매크로·배치 대상이 됩니다. 콘솔 포트를 팜이 골라 시작 응답에 시리얼을 바로 돌려주고, `wait`로 부팅
+  완료까지 기다리며, `owner`를 주면 같은 호출에서 점유까지 합니다. `-no-snapshot-save`로 매 실행이
+  같은 상태에서 시작하고, 하드웨어 가속 없음 같은 즉시 실패는 에뮬레이터 로그 끝부분과 함께 바로
+  돌려줍니다. 남이 점유한 에뮬레이터 종료는 `409`. 서버를 재시작해도 에뮬레이터는 살아 있고, 재시작
+  뒤에는 `adb emu avd name`으로 어느 AVD인지 다시 찾습니다. 실제 Android SDK(emulator 37.2,
+  platform-tools 37.0.1)로 SDK 탐지·AVD 생성/삭제·하드웨어 가속 없음 실패 보고를 확인했습니다.
+- **`/api/devices/occupy`의 `kind`** — `physical`/`virtual`로 실기기나 에뮬레이터만 골라 잡습니다
+  (`cli.py occupy --kind`). `/api/devices`에는 `virtual`·`avd`, `/api/health`에는 `devices_virtual`과
+  SDK 탐지 결과(`virtual`)가 추가됐습니다. SDK가 없어도 상태는 `ok`입니다.
 - **시스템 정보 패널에 제조사·해상도·CPU·ABI·RAM·빌드·실행 중인 앱** — `/api/info`가 이미
   돌려주던 값을 모달이 버리고 모델·OS·IP·UID만 그리고 있었습니다. 해상도·ABI·빌드 ID는
   응답에 새로 넣었습니다(레이아웃 버그가 특정 태블릿에서만 날 때 제일 먼저 보는 값들).

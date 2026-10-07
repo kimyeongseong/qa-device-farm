@@ -42,6 +42,7 @@ Browser (dashboard)          CLI / CI pipeline
 | **Wireless debugging** | One button for `tcpip 5555` + `connect`. Survives unplugging the cable. |
 | **Audio forwarding** | Device audio to the PC through the scrcpy binary. |
 | **Picture-in-Picture** | Float the mirror in an always-on-top window: keep watching a device while working elsewhere, or several at once. |
+| **Virtual devices (emulators)** | Create, boot and stop Android SDK AVDs from the dashboard or the API. A running emulator is leased, driven, logged, macro-replayed and batched exactly like a real phone — the OS version or screen size that is not on the shelf is one click away. |
 | **CLI / CI** | No sessions — claim, drive, read logs and release over plain HTTP. |
 
 ---
@@ -185,6 +186,41 @@ Measured on a Lenovo TB373FU over USB: full 2944×1840 resolution, about **1.3 s
 
 Use it where Node cannot be installed, or when the stream server is down. The **[간이 미러링 / Simple mirror]** button on each device card opens it.
 
+### Virtual devices (emulators)
+
+Real phones come in a fixed number, and the OS version or screen size a bug report names is never the one on the shelf. The farm starts and stops Android SDK emulators (AVDs) itself to fill that gap.
+
+**You need:** the SDK `emulator` package, at least one system image, and hardware acceleration (WHPX/Hyper-V on Windows, KVM on Linux, Hypervisor.framework on mac). To **create and delete** AVDs from the farm you also need `avdmanager` (Android SDK Command-line Tools) and Java. Starting and stopping AVDs already made in Android Studio needs neither.
+
+The SDK is found through `ANDROID_HOME` → `ANDROID_SDK_ROOT` → Android Studio's default location per OS → the SDK that the adb on PATH belongs to; AVDs are read from `ANDROID_AVD_HOME` (default `~/.android/avd`). What was found is reported under `virtual` in `GET /api/health`. Without an SDK the farm is still `ok` — only the virtual-device feature is off, with the reason.
+
+**[＋ 가상 기기 / Virtual devices]** at the top of the dashboard lists AVDs with their state (stopped / starting / booting / running / failed) and starts, stops, deletes or creates them. A booted emulator joins the device grid as `emulator-5554` with a `VIRTUAL` badge, and from then on mirroring, leases, input, logcat, macros and batch runs treat it like any other device.
+
+```bash
+python cli.py avd-images                     # installed system images
+python cli.py avd-create --name Pixel_6_API_34 \
+    --image "system-images;android-34;google_apis;x86_64" --device pixel_6
+python cli.py avds                           # AVDs and their state
+
+# wait until Android has booted, and lease it in the same call
+python cli.py avd-start --name Pixel_6_API_34 --wait --owner ci-smoke
+python cli.py avd-stop  --name Pixel_6_API_34 --owner ci-smoke
+
+# pick only real phones, or only emulators
+python cli.py occupy --owner ci-smoke --kind virtual
+```
+
+Worth knowing:
+
+- **Every run starts from the same state.** Emulators run with `-no-snapshot-save`, so one run's leftovers never reach the next. **[초기화 후 시작 / Wipe & start]** (`wipe: true`) factory-resets; `cold_boot: true` skips the quick-boot snapshot.
+- **Headless by default** — the farm is used through the browser. `--window` (`headless: false`) shows it on the host.
+- **The serial is known immediately.** The farm picks the console port (even, 5554–5682) itself, so the start response carries `serial` straight away; nobody has to guess which new device in the list is theirs while it boots.
+- **An emulator serial names a port, not a device.** The next emulator on that port may be a different AVD, so stopping one, or starting a new one on its port, clears leases and cached detail held under `emulator-<port>`.
+- **Stopping respects leases.** Shutting down an emulator someone else holds is refused with `409`; it would end their run.
+- **Emulators survive a server restart.** They are launched in their own session / process group so `Ctrl+C` does not reach them, and after a restart the farm works out which AVD each one runs through adb (`emu avd name`).
+- **Immediate failures are reported immediately.** No hardware acceleration, a missing engine — the common failures end the process before it ever registers with adb. The start call waits for one or the other (up to 15 s), and on failure lifts the emulator's own `ERROR` line into the message, e.g. `Emulator exited immediately (code 1): x86_64 emulation currently requires hardware acceleration!`, with the tail of the log. The full log is `logs/emulator_<AVD>.log`.
+- **Launched with `-no-metrics`.** Emulator 37 prints a usage-statistics consent notice on every launch and announces it will become a blocking prompt in a future release; nobody is at the console of a headless farm emulator to answer it.
+
 To preset device aliases, copy `device_aliases.example.json` to `device_aliases.json` and edit. That file holds real serials, so it is gitignored.
 
 ---
@@ -261,7 +297,7 @@ The full spec is generated at `http://localhost:8001/docs`. The ones you will ac
 | `GET` | `/api/devices` | Device list with lease state and `state`/`state_hint`. `?refresh=1` bypasses the cache |
 | `GET` | `/api/device/{serial}/screenshot` | JPEG screenshot |
 | `GET` | `/api/info/{serial}` | Details (manufacturer, CPU, current app, IP) |
-| `POST` | `/api/devices/occupy` | Claim any free device |
+| `POST` | `/api/devices/occupy` | Claim any free device (`kind`: `physical` / `virtual` narrows it) |
 | `POST` | `/api/device/{serial}/occupy` | Claim a specific device |
 | `POST` | `/api/device/{serial}/release` | Hand it back |
 | `GET` | `/api/leases` | Who holds what |
@@ -290,6 +326,13 @@ The full spec is generated at `http://localhost:8001/docs`. The ones you will ac
 | `POST` | `/api/batch/app` | App control on several devices |
 | `POST` | `/api/batch/macro` | Macro replay on several devices |
 | `POST` | `/api/batch/install` | APK install on several devices |
+| `GET` | `/api/avds` | AVDs with state (`stopped`/`starting`/`booting`/`running`/`failed`), serial and lease holder |
+| `POST` | `/api/avds` | Create an AVD (`name`, `image`, `device`) — needs avdmanager |
+| `DELETE` | `/api/avds/{name}` | Delete an AVD (409 while it runs) |
+| `POST` | `/api/avds/{name}/start` | Start an emulator (`wait`, `timeout`, `wipe`, `cold_boot`, `headless`, `gpu`, `owner`) |
+| `POST` | `/api/avds/{name}/stop` | Stop an emulator (lease enforced) |
+| `GET` | `/api/sdk/system-images` | Installed system images |
+| `GET` | `/api/sdk/device-profiles` | Hardware profiles (`pixel_6`, ...) |
 | `WS` | `/ws/video/{serial}` | screenrecord H.264 stream |
 | `WS` | `/ws/control/{serial}` | Live input channel |
 
@@ -340,17 +383,18 @@ python tests/run_all.py
 test_leases_and_input.py     ok       26 passed, 0 failed
 test_features.py             ok      194 passed, 0 failed
 test_edge_cases.py           ok       15 passed, 0 failed
-test_cli.py                  ok       24 passed, 0 failed
-259 passed, 0 failed across 4 suites
+test_virtual_devices.py      ok       86 passed, 0 failed
+test_cli.py                  ok       29 passed, 0 failed
+350 passed, 0 failed across 5 suites
 ```
 
 Each suite runs in its own process with a temporary directory as cwd, so one suite's monkeypatching and runtime state (`device_leases.json`, `macros/`) cannot leak into another, and the working tree stays clean.
 
-What is covered: lease conflicts, TTL expiry and pool exhaustion; input injection rejection; macro rescaling and v1 compatibility; path traversal; app-control argv; crash pattern matching; logcat dead-session recovery and file capture; batch partial-failure isolation; four kinds of wireless serial; the device cache; lease persistence; the access-token boundary; selective cleanup of leftover stream processes; and every CLI subcommand.
+What is covered: lease conflicts, TTL expiry and pool exhaustion; input injection rejection; macro rescaling and v1 compatibility; path traversal; app-control argv; crash pattern matching; logcat dead-session recovery and file capture; batch partial-failure isolation; four kinds of wireless serial; the device cache; lease persistence; the access-token boundary; selective cleanup of leftover stream processes; the emulator lifecycle (create, start, boot, early failure, stop and port reuse, against a fake SDK directory and a fake emulator process); and every CLI subcommand.
 
 `cli.py` is driven as a real subprocess, because an argument-handling bug lived there that no in-process test could see.
 
-**Anything that genuinely needs hardware** is not automated: mirroring quality and latency, audio, real crash detection, the wireless switch. Those were verified by hand on real devices.
+**Anything that genuinely needs hardware** is not automated: mirroring quality and latency, audio, real crash detection, the wireless switch. Those were verified by hand on real devices. Booting a real Android emulator is in the same category: the suite runs without an SDK, against a fake emulator.
 
 ---
 
@@ -379,4 +423,5 @@ The reasoning and the boundaries are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
 - **No Korean or emoji input.** `adb shell input text` is ASCII only; the device needs its own IME.
 - **Macros are still coordinate-based.** Resolution differences are corrected by proportional scaling, but devices with a different aspect ratio or a re-flowed layout (foldables, tablets) will not match. It does not find UI elements. Macros recorded before this feature have no resolution and replay unscaled.
 - **The in-memory log buffer is 20k lines per device** and is lost on restart. It fills faster than you would expect — measured at 400–1,000 lines/second at level V on a tablet with an app running, so it wraps in **30–60 seconds**. The log tab warns you (`버퍼 가득 · 오래된 로그 삭제 중`) once it is at the cap, but for a long reproduction enable `to_file` from the start; the full log lands in `logs/`.
+- **Emulators use the farm host's resources.** Each takes 2–4 GB of RAM and several CPU cores, and without hardware acceleration it will not start at all. The host's capacity decides how many can run at once; the farm sets no limit of its own. Installing system images (`sdkmanager`) is not done by the farm either — it is a multi-GB download, left to whoever administers the host.
 - **PiP is Chromium-only.** Firefox has no such API, so the button does not appear at all. Browser policy requires a real user click to enter it.

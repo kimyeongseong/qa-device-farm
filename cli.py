@@ -10,6 +10,11 @@ Lets a terminal or a CI job use the farm without a browser:
 
 `occupy` without --serial takes any free device and prints its serial, which is
 what a pipeline wants: ask for an Android, get one, run, hand it back.
+
+Emulators (AVDs) are farm devices too. Boot one, hold it, run, shut it down:
+
+    python cli.py avd-start --name Pixel_6_API_34 --wait --owner ci-smoke
+    python cli.py avd-stop  --name Pixel_6_API_34 --owner ci-smoke
 """
 
 import argparse
@@ -36,11 +41,11 @@ def split_serials(raw):
     return serials
 
 
-def call(base, method, path, payload=None):
+def call(base, method, path, payload=None, timeout=30):
     url = f"{base}{path}"
     try:
         resp = requests.request(method, url, json=payload,
-                                headers=auth_headers(), timeout=30)
+                                headers=auth_headers(), timeout=timeout)
     except requests.RequestException as e:
         sys.exit(f"cannot reach farm at {base}: {e}")
 
@@ -72,6 +77,8 @@ def main():
     occupy.add_argument("--serial", help="specific device; omit to take any free one")
     occupy.add_argument("--owner", required=True)
     occupy.add_argument("--ttl", type=int, default=600, help="lease seconds (default 600)")
+    occupy.add_argument("--kind", choices=["physical", "virtual"],
+                        help="with no --serial: only real phones, or only emulators")
 
     release = sub.add_parser("release", help="hand a device back")
     release.add_argument("--serial", required=True)
@@ -147,6 +154,34 @@ def main():
     bins.add_argument("--apk", required=True)
     bins.add_argument("--owner")
 
+    sub.add_parser("avds", help="list emulators (AVDs) and whether they are running")
+    sub.add_parser("avd-images", help="system images installed in the SDK")
+    sub.add_parser("avd-profiles", help="hardware profiles for avd-create --device")
+
+    avd_new = sub.add_parser("avd-create", help="define a new emulator")
+    avd_new.add_argument("--name", required=True)
+    avd_new.add_argument("--image", required=True,
+                         help="e.g. 'system-images;android-34;google_apis;x86_64'")
+    avd_new.add_argument("--device", help="hardware profile, e.g. pixel_6")
+
+    avd_up = sub.add_parser("avd-start", help="boot an emulator")
+    avd_up.add_argument("--name", required=True)
+    avd_up.add_argument("--wait", action="store_true", help="return only once Android has booted")
+    avd_up.add_argument("--timeout", type=int, default=300, help="boot wait seconds (default 300)")
+    avd_up.add_argument("--wipe", action="store_true", help="factory-reset before boot")
+    avd_up.add_argument("--cold", action="store_true", help="cold boot, skip the quick-boot snapshot")
+    avd_up.add_argument("--window", action="store_true", help="show the emulator window on the farm host")
+    avd_up.add_argument("--gpu", choices=["auto", "host", "swiftshader_indirect", "angle_indirect", "guest"])
+    avd_up.add_argument("--owner", help="lease the new emulator to this owner")
+    avd_up.add_argument("--ttl", type=int, default=600)
+
+    avd_down = sub.add_parser("avd-stop", help="shut an emulator down")
+    avd_down.add_argument("--name", required=True)
+    avd_down.add_argument("--owner")
+
+    avd_rm = sub.add_parser("avd-delete", help="delete an emulator definition")
+    avd_rm.add_argument("--name", required=True)
+
     a = p.parse_args()
     global TOKEN
     if a.token:
@@ -161,6 +196,8 @@ def main():
 
     if a.cmd == "occupy":
         body = {"owner": a.owner, "ttl_seconds": a.ttl}
+        if a.kind:
+            body["kind"] = a.kind
         path = f"/api/device/{a.serial}/occupy" if a.serial else "/api/devices/occupy"
         return call(a.base, "POST", path, body)
 
@@ -185,6 +222,33 @@ def main():
 
     if a.cmd == "macros":
         return call(a.base, "GET", "/api/macros")
+
+    if a.cmd == "avds":
+        return call(a.base, "GET", "/api/avds")
+    if a.cmd == "avd-images":
+        return call(a.base, "GET", "/api/sdk/system-images")
+    if a.cmd == "avd-profiles":
+        return call(a.base, "GET", "/api/sdk/device-profiles", timeout=120)
+    if a.cmd == "avd-create":
+        body = {"name": a.name, "image": a.image}
+        if a.device:
+            body["device"] = a.device
+        return call(a.base, "POST", "/api/avds", body, timeout=240)
+    if a.cmd == "avd-start":
+        body = {"wait": a.wait, "timeout": a.timeout, "wipe": a.wipe,
+                "cold_boot": a.cold, "headless": not a.window, "ttl_seconds": a.ttl}
+        if a.gpu:
+            body["gpu"] = a.gpu
+        if a.owner:
+            body["owner"] = a.owner
+        # With --wait the server holds the request until boot finishes.
+        return call(a.base, "POST", f"/api/avds/{a.name}/start", body,
+                    timeout=(a.timeout + 30) if a.wait else 30)
+    if a.cmd == "avd-stop":
+        body = {"owner": a.owner} if a.owner else {}
+        return call(a.base, "POST", f"/api/avds/{a.name}/stop", body, timeout=60)
+    if a.cmd == "avd-delete":
+        return call(a.base, "DELETE", f"/api/avds/{a.name}", timeout=90)
 
     if a.cmd == "macro-delete":
         return call(a.base, "DELETE", f"/api/macros/{a.name}")

@@ -418,6 +418,44 @@
             justify-content: space-between;
         }
 
+        .avd-row {
+            padding: 10px 8px;
+            border-bottom: 1px solid #222;
+            font-family: 'JetBrains Mono', 'Malgun Gothic';
+            font-size: 0.85em;
+            color: #aaa;
+        }
+
+        .avd-row-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .avd-input {
+            background: #111;
+            border: 1px solid #333;
+            color: #ddd;
+            padding: 6px;
+            font-family: 'JetBrains Mono';
+            font-size: 0.8em;
+        }
+
+        .virtual-badge {
+            position: absolute;
+            top: 5px;
+            left: 70px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #8ef;
+            padding: 2px 6px;
+            font-size: 0.8em;
+            border-radius: 4px;
+            border: 1px solid #356;
+            z-index: 10;
+            font-family: 'JetBrains Mono';
+        }
+
         ::-webkit-scrollbar {
             width: 4px;
         }
@@ -444,9 +482,37 @@
             <div style="font-size:0.8em; color:#666; font-family:'JetBrains Mono'; margin-top:5px; letter-spacing:1px;">
                 MANAGED BY QA TEAM</div>
         </div>
-        <div class="system-status" id="farm-status" title="">
-            <div class="status-dot" id="status-dot"></div>
-            <span id="status-text">상태 확인 중…</span>
+        <div style="display:flex; gap:12px; align-items:center;">
+            <button class="btn btn-delete" style="color:#8ef; border-color:#356; padding:8px 14px;"
+                title="에뮬레이터(AVD)를 만들고 켜고 끕니다. 켜진 에뮬레이터는 실기기와 똑같이 목록에 나옵니다."
+                onclick="openAvdModal()">＋ 가상 기기</button>
+            <div class="system-status" id="farm-status" title="">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">상태 확인 중…</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Virtual devices (AVD) Modal -->
+    <div id="avdModal" class="modal-overlay">
+        <div class="modal" style="width:760px; max-width:95vw;">
+            <span class="close-btn" style="float:right; cursor:pointer; color:#fff; font-size:1.5em;"
+                onclick="closeAvdModal()">×</span>
+            <h2 style="color:white; margin-top:0; font-family:'JetBrains Mono';">가상 기기 (에뮬레이터)</h2>
+            <div id="avd-sdk" style="font-family:'JetBrains Mono'; font-size:0.75em; color:#666; margin-bottom:12px;"></div>
+            <div id="avd-list" style="max-height:360px; overflow-y:auto; border:1px solid #222;"></div>
+            <details id="avd-create" style="margin-top:16px; font-family:'JetBrains Mono', 'Malgun Gothic'; color:#aaa;"
+                ontoggle="if (this.open) loadAvdCreateOptions()">
+                <summary style="cursor:pointer; color:#ddd;">＋ 새 AVD 만들기</summary>
+                <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+                    <input id="avd-new-name" class="avd-input" placeholder="이름 (예: Pixel_6_API_34)">
+                    <select id="avd-new-image" class="avd-input"></select>
+                    <input id="avd-new-device" class="avd-input" list="avd-profiles"
+                        placeholder="하드웨어 프로필 (예: pixel_6 — 비우면 기본값)">
+                    <datalist id="avd-profiles"></datalist>
+                    <button class="btn btn-manage" style="margin-top:4px;" id="avd-create-btn" onclick="createAvd()">만들기</button>
+                </div>
+            </details>
         </div>
     </div>
 
@@ -717,6 +783,7 @@
                     card.innerHTML = `
                          <div style="position:relative;">
                              <div style="position:absolute; top:5px; left:5px; background:rgba(0,0,0,0.7); color:#0f0; padding:2px 6px; font-size:0.8em; border-radius:4px; border:1px solid #0f0; z-index:10;">No.${index + 1}</div>
+                             ${dev.virtual ? `<div class="virtual-badge" title="에뮬레이터${dev.avd ? ' · ' + escapeHtml(dev.avd) : ''}">VIRTUAL</div>` : ''}
                              ${usable ? `<input type="checkbox" class="batch-check" title="일괄 작업 대상으로 선택"
                                     ${batchSelected.has(dev.serial) ? 'checked' : ''}
                                     onchange="toggleBatch('${dev.serial}', this.checked)">` : ''}
@@ -1204,7 +1271,9 @@ ${data.file}`);
             if (server.note) notes.push('adb 서버 버전 낮음');
 
             box.className = 'system-status' + (notes.length ? ' warn' : '');
-            text.textContent = `기기 ${h.devices_total}대 · 유휴 ${h.devices_free}`
+            text.textContent = `기기 ${h.devices_total}대`
+                + (h.devices_virtual ? ` (가상 ${h.devices_virtual})` : '')
+                + ` · 유휴 ${h.devices_free}`
                 + (notes.length ? ' · ' + notes.join(' · ') : '');
 
             const tips = [`adb: ${h.adb_path}`, `adb 서버 버전: ${server.version ?? '알 수 없음'}`];
@@ -1214,6 +1283,157 @@ ${data.file}`);
                     .map(([s, st]) => `${s} (${st})`).join(', '));
             }
             box.title = tips.join('\n');
+        }
+
+        // --- Virtual devices (AVD) ---
+        // The emulator itself is driven by the farm; once it has booted it is
+        // an ordinary card in the grid, with mirroring, leases and batch runs.
+        let avdPollTimer = null;
+
+        function openAvdModal() {
+            document.getElementById('avdModal').style.display = 'flex';
+            loadAvds();
+            clearInterval(avdPollTimer);
+            avdPollTimer = setInterval(loadAvds, 3000);
+        }
+
+        function closeAvdModal() {
+            document.getElementById('avdModal').style.display = 'none';
+            clearInterval(avdPollTimer);
+            avdPollTimer = null;
+        }
+
+        const AVD_STATUS = {
+            stopped:  ['#666', '■ 중지됨'],
+            starting: ['#fc6', '◌ 시작 중'],
+            booting:  ['#fc6', '◌ 부팅 중'],
+            running:  ['var(--success-color)', '● 실행 중'],
+            failed:   ['#ff6b6b', '✕ 실패'],
+        };
+
+        async function loadAvds() {
+            const list = document.getElementById('avd-list');
+            const sdkBox = document.getElementById('avd-sdk');
+            let d;
+            try {
+                d = await (await apiFetch('/api/avds')).json();
+            } catch (e) {
+                list.innerHTML = '<div class="avd-row">서버에 연결할 수 없습니다.</div>';
+                return;
+            }
+            const sdk = d.sdk || {};
+            sdkBox.innerHTML = sdk.note
+                ? `<span style="color:#ff9f43;">⚠ ${escapeHtml(sdk.note)}</span>`
+                : `SDK ${escapeHtml(sdk.sdk_root || '-')} · AVD ${escapeHtml(sdk.avd_home || '-')}`;
+
+            const avds = d.avds || [];
+            if (!avds.length) {
+                list.innerHTML = `<div class="avd-row">정의된 AVD가 없습니다. 아래 [새 AVD 만들기]나 Android Studio의 Device Manager로 만드세요.</div>`;
+                return;
+            }
+
+            // Names come from file names on disk, so they are escaped and handed
+            // to the handlers through data attributes rather than inline strings.
+            list.innerHTML = avds.map(a => {
+                const [color, label] = AVD_STATUS[a.status] || ['#888', a.status];
+                const name = escapeHtml(a.name);
+                const meta = [
+                    a.api ? `API ${escapeHtml(a.api)}` : null,
+                    a.tag ? escapeHtml(a.tag) : null,
+                    a.width && a.height ? `${a.width}x${a.height}` : null,
+                    a.device ? escapeHtml(a.device) : null,
+                ].filter(Boolean).join(' · ');
+                const active = ['starting', 'booting', 'running'].includes(a.status);
+                const lease = a.occupied_by ? ` · <span style="color:#ffb454;">🔒 ${escapeHtml(a.occupied_by)}</span>` : '';
+                const buttons = active
+                    ? `<button class="btn btn-delete" style="color:#ccc; border-color:#555;" data-name="${name}" onclick="avdAction(this.dataset.name, 'stop')">종료</button>`
+                    : `<button class="btn btn-delete" style="color:#8f8; border-color:#363;" data-name="${name}" onclick="avdAction(this.dataset.name, 'start')" ${a.broken ? 'disabled' : ''}>시작</button>
+                       <button class="btn btn-delete" style="color:#fc8; border-color:#653;" data-name="${name}" onclick="avdAction(this.dataset.name, 'wipe')" ${a.broken ? 'disabled' : ''} title="데이터를 모두 지우고 공장 초기화 상태로 부팅">초기화 후 시작</button>
+                       <button class="btn btn-delete" data-name="${name}" onclick="avdAction(this.dataset.name, 'delete')">삭제</button>`;
+                const failure = a.status === 'failed'
+                    ? `<pre class="log-line crash" style="margin:8px 0 0; max-height:120px; overflow:auto;">${escapeHtml(a.detail || '')}
+${escapeHtml((a.log || []).join('\n'))}</pre>`
+                    : '';
+                const broken = a.broken ? ` · <span style="color:#ff9f43;">config.ini 없음</span>` : '';
+                return `<div class="avd-row">
+                    <div class="avd-row-head">
+                        <span><span style="color:#fff;">${name}</span><br>
+                            <span style="font-size:0.85em; color:#666;">${meta || '-'}</span></span>
+                        <span style="display:flex; gap:5px; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
+                            <span style="color:${color}; margin-right:6px;">${label}${a.serial ? ` <span style="color:#666;">${escapeHtml(a.serial)}</span>` : ''}${lease}${broken}</span>
+                            ${buttons}
+                        </span>
+                    </div>${failure}
+                </div>`;
+            }).join('');
+        }
+
+        async function avdAction(name, action) {
+            const path = `/api/avds/${encodeURIComponent(name)}`;
+            if (action === 'start' || action === 'wipe') {
+                if (action === 'wipe' && !confirm(`${name}\n\n에뮬레이터의 데이터를 모두 지우고 부팅합니다. 계속할까요?`)) return;
+                const { ok, data } = await postJson(`${path}/start`, { wipe: action === 'wipe' });
+                if (!ok) {
+                    alert(`시작 실패: ${data.message || '알 수 없는 오류'}`
+                        + (data.log && data.log.length ? `\n\n${data.log.slice(-8).join('\n')}` : ''));
+                }
+            } else if (action === 'stop') {
+                if (!confirm(`${name} 에뮬레이터를 종료합니다. 진행 중인 테스트가 있으면 끊깁니다.`)) return;
+                const { ok, data } = await postJson(`${path}/stop`, {});
+                if (!ok) {
+                    alert(data.owner
+                        ? `종료 불가\n\n'${data.owner}' 님이 이 에뮬레이터를 점유 중입니다.`
+                        : `종료 실패: ${data.message || '알 수 없는 오류'}`);
+                }
+            } else if (action === 'delete') {
+                if (!confirm(`${name} AVD를 삭제합니다. 디스크 이미지까지 지워지며 되돌릴 수 없습니다.`)) return;
+                const res = await apiFetch(path, { method: 'DELETE' });
+                if (!res.ok) {
+                    const d = await res.json().catch(() => ({}));
+                    alert(`삭제 실패: ${d.message || res.status}`);
+                }
+            }
+            loadAvds();
+            fetchDevices();
+        }
+
+        let avdOptionsLoaded = false;
+        async function loadAvdCreateOptions() {
+            if (avdOptionsLoaded) return;
+            avdOptionsLoaded = true;
+            const select = document.getElementById('avd-new-image');
+            select.innerHTML = '<option value="">시스템 이미지 불러오는 중…</option>';
+            const images = ((await (await apiFetch('/api/sdk/system-images')).json()).images) || [];
+            select.innerHTML = images.length
+                ? images.map(i => `<option value="${escapeHtml(i.id)}">API ${escapeHtml(i.api)} · ${escapeHtml(i.tag)} · ${escapeHtml(i.abi)}</option>`).join('')
+                : '<option value="">설치된 시스템 이미지 없음 — sdkmanager로 먼저 설치하세요</option>';
+
+            // avdmanager starts a JVM for this, so it comes in after the form is usable.
+            apiFetch('/api/sdk/device-profiles').then(r => r.json()).then(d => {
+                document.getElementById('avd-profiles').innerHTML =
+                    (d.profiles || []).map(p => `<option value="${escapeHtml(p)}">`).join('');
+            }).catch(() => {});
+        }
+
+        async function createAvd() {
+            const name = document.getElementById('avd-new-name').value.trim();
+            const image = document.getElementById('avd-new-image').value;
+            const device = document.getElementById('avd-new-device').value.trim();
+            if (!name || !image) { alert('이름과 시스템 이미지를 고르세요.'); return; }
+            const btn = document.getElementById('avd-create-btn');
+            btn.disabled = true;
+            btn.innerText = '만드는 중…';
+            try {
+                const body = { name, image };
+                if (device) body.device = device;
+                const { ok, data } = await postJson('/api/avds', body);
+                if (!ok) { alert(`생성 실패: ${data.message || '알 수 없는 오류'}`); return; }
+                document.getElementById('avd-new-name').value = '';
+                loadAvds();
+            } finally {
+                btn.disabled = false;
+                btn.innerText = '만들기';
+            }
         }
 
         fetchDevices();
