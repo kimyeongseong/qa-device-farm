@@ -218,7 +218,8 @@ Worth knowing:
 - **An emulator serial names a port, not a device.** The next emulator on that port may be a different AVD, so stopping one, or starting a new one on its port, clears leases and cached detail held under `emulator-<port>`.
 - **Stopping respects leases.** Shutting down an emulator someone else holds is refused with `409`; it would end their run.
 - **Emulators survive a server restart.** They are launched in their own session / process group so `Ctrl+C` does not reach them, and after a restart the farm works out which AVD each one runs through adb (`emu avd name`).
-- **Immediate failures are reported immediately.** No hardware acceleration, a missing engine — the common failures end the process within a second or two, so the start call answers with the error and the tail of the emulator's log. The full log is `logs/emulator_<AVD>.log`.
+- **Immediate failures are reported immediately.** No hardware acceleration, a missing engine — the common failures end the process before it ever registers with adb. The start call waits for one or the other (up to 15 s), and on failure lifts the emulator's own `ERROR` line into the message, e.g. `Emulator exited immediately (code 1): x86_64 emulation currently requires hardware acceleration!`, with the tail of the log. The full log is `logs/emulator_<AVD>.log`.
+- **Launched with `-no-metrics`.** Emulator 37 prints a usage-statistics consent notice on every launch and announces it will become a blocking prompt in a future release; nobody is at the console of a headless farm emulator to answer it.
 
 To preset device aliases, copy `device_aliases.example.json` to `device_aliases.json` and edit. That file holds real serials, so it is gitignored.
 

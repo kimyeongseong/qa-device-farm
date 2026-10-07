@@ -1926,6 +1926,23 @@ class AvdStartRequest(BaseModel):
     owner: str = None
     ttl_seconds: int = DEFAULT_LEASE_SECONDS
 
+async def wait_past_launch(entry: dict, serial: str):
+    """Wait until a new emulator has either died or registered with adb.
+
+    Returns its exit code if it died, None once adb lists it (or the grace
+    period runs out with it still alive). A fixed sleep was either too long
+    for the common instant failure or too short for the slow first run.
+    """
+    deadline = time.time() + vd.EARLY_EXIT_GRACE
+    while time.time() < deadline:
+        code = entry["proc"].poll()
+        if code is not None:
+            return code
+        if serial in await asyncio.to_thread(list_device_states):
+            return None
+        await asyncio.sleep(vd.LAUNCH_POLL)
+    return entry["proc"].poll()
+
 async def wait_for_boot(name: str, serial: str, timeout: int):
     """Poll until the emulator reports sys.boot_completed. Returns the final state."""
     deadline = time.time() + max(1, timeout)
@@ -1983,13 +2000,15 @@ async def start_avd(name: str, req: AvdStartRequest = AvdStartRequest()):
 
     print(f"[{serial}] Starting AVD {name}: {' '.join(cmd)}")
 
-    await asyncio.sleep(vd.EARLY_EXIT_GRACE)
-    code = entry["proc"].poll()
+    code = await wait_past_launch(entry, serial)
     if code is not None:
         vd.launched.pop(name, None)
+        reason = vd.failure_reason(entry["log"])
         return JSONResponse({
             "status": "error",
-            "message": f"Emulator exited immediately (code {code}). See the log below or {entry['log']}.",
+            "message": (f"Emulator exited immediately (code {code})"
+                        + (f": {reason}" if reason else "")
+                        + f" (full log: {entry['log']})"),
             "log": vd.log_tail(entry["log"]),
         }, status_code=500)
 
@@ -2009,7 +2028,9 @@ async def start_avd(name: str, req: AvdStartRequest = AvdStartRequest()):
         return body
     body["status"] = "error"
     if state == "failed":
-        body["message"] = f"Emulator exited during boot (code {entry['proc'].poll()})"
+        reason = vd.failure_reason(entry["log"])
+        body["message"] = (f"Emulator exited during boot (code {entry['proc'].poll()})"
+                           + (f": {reason}" if reason else ""))
         body["log"] = vd.log_tail(entry["log"])
         vd.launched.pop(name, None)
         return JSONResponse(body, status_code=500)

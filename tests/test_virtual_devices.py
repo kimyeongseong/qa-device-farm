@@ -59,7 +59,12 @@ write(FAKE_EMU, """import sys, time
 name = sys.argv[sys.argv.index('-avd') + 1]
 print('emulator: argv', ' '.join(sys.argv[1:]), flush=True)
 if name.startswith('Crash'):
-    print('ERROR: x86_64 emulation currently requires hardware acceleration!', flush=True)
+    # Captured from emulator 37.2 on a host without KVM.
+    print('INFO         | Android emulator version 37.2.12.0 (build_id 16428233) (CL:N/A)', flush=True)
+    print('INFO         |   Checking: hasSufficientSystem', flush=True)
+    print('WARNING      | encryption is off', flush=True)
+    print('ERROR        | x86_64 emulation currently requires hardware acceleration!', flush=True)
+    print('CPU acceleration status: KVM requires a CPU that supports vmx or svm', flush=True)
     sys.exit(1)
 time.sleep(120)
 """)
@@ -73,6 +78,7 @@ def fake_build(emulator, name, port, **kw):
 vd.build_command = fake_build
 vd.emulator_binary = lambda: "/sdk/emulator/emulator"
 vd.EARLY_EXIT_GRACE = 0.7
+vd.LAUNCH_POLL = 0.05
 vd.BOOT_POLL = 0.05
 
 # A real emulator answers `adb emu kill`; the fake one is simply out-waited and
@@ -159,7 +165,7 @@ try:
     cmd = real_build("emu", "Pixel_6_API_34", 5556)
     check("default command: fixed port, no snapshot save, headless",
           cmd == ["emu", "-avd", "Pixel_6_API_34", "-port", "5556", "-no-snapshot-save",
-                  "-no-boot-anim", "-no-window"], str(cmd))
+                  "-no-boot-anim", "-no-metrics", "-no-window"], str(cmd))
     cmd = real_build("emu", "X", 5554, headless=False, wipe=True, cold_boot=True, gpu="swiftshader_indirect")
     check("options map to flags",
           "-no-window" not in cmd and "-wipe-data" in cmd and "-no-snapshot-load" in cmd
@@ -178,6 +184,12 @@ try:
     check("crashing emulator -> 500", r.status_code == 500, r.text)
     check("failure carries the emulator's own words",
           any("hardware acceleration" in ln for ln in r.json().get("log", [])), r.text)
+    check("the ERROR line is lifted into the message",
+          "requires hardware acceleration!" in r.json().get("message", ""), r.text)
+    t0 = time.time()
+    c.post("/api/avds/Crash_API_34/start", json={})
+    check("instant failure answered without sitting out the grace period",
+          time.time() - t0 < vd.EARLY_EXIT_GRACE, f"{time.time() - t0:.2f}s")
     check("crashed launch not left in the table", "Crash_API_34" not in vd.launched)
 
     print()
@@ -287,11 +299,15 @@ try:
     class DeadProc:
         def __init__(self, code): self.code = code
         def poll(self): return self.code
-    logp = os.path.join(WORK, "dead.log"); write(logp, "line1\nPANIC: Broken AVD system path\n")
+    logp = os.path.join(WORK, "dead.log"); write(logp, "INFO    | line1\nPANIC: Broken AVD system path\n")
     vd.launched["Pixel_6_API_34"] = {"proc": DeadProc(1), "port": 5554, "serial": "emulator-5554",
                                      "started": time.time(), "log": logp}
     a = avds()["Pixel_6_API_34"]
     check("nonzero exit -> failed with log", a["status"] == "failed" and "PANIC" in " ".join(a.get("log", [])), str(a))
+    check("failed status names the reason", a["detail"].endswith(": Broken AVD system path"), a["detail"])
+    write(logp, "INFO    | nothing useful\n")
+    check("no ERROR line -> plain exit code", vd.failure_reason(logp) is None)
+    check("missing log file -> None", vd.failure_reason(os.path.join(WORK, "nope.log")) is None)
     c.post("/api/avds/Pixel_6_API_34/stop", json={})
     check("stop clears a failed entry", "Pixel_6_API_34" not in vd.launched)
     vd.launched["Pixel_6_API_34"] = {"proc": DeadProc(0), "port": 5554, "serial": "emulator-5554",

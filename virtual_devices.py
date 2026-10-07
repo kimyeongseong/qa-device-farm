@@ -50,10 +50,19 @@ FIRST_PORT, LAST_PORT = 5554, 5682
 LOG_DIR = "logs"
 
 # A missing engine, no hardware acceleration, a locked AVD: the common failures
-# all make the emulator exit within a second or two. Waiting that long before
-# answering turns them into an immediate error instead of a silent "starting".
-EARLY_EXIT_GRACE = 2.0
+# all make the emulator exit before it ever registers with adb. The start call
+# waits for one or the other, so they come back as an immediate error instead
+# of a silent "starting". Measured with emulator 37.2: a missing-acceleration
+# exit takes 0.05s normally, but several seconds on the first run after the
+# SDK is installed -- which is exactly when someone is trying it out -- so a
+# fixed two-second wait missed it. The cap only matters on that slow path.
+EARLY_EXIT_GRACE = 15.0
+LAUNCH_POLL = 0.25
 BOOT_POLL = 2.0
+
+# The lines an emulator prints when it gives up. Its log opens with a dozen
+# INFO lines, and the one that explains the failure is easy to miss among them.
+FAILURE_LINE = re.compile(r"^(?:ERROR|PANIC|FATAL)\b[\s|:]*(.*)$")
 
 
 class VirtualDeviceError(Exception):
@@ -426,6 +435,20 @@ def is_booted(serial: str) -> bool:
     return done
 
 
+def failure_reason(path):
+    """The emulator's own explanation for exiting, e.g.
+    'x86_64 emulation currently requires hardware acceleration!', or None."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                match = FAILURE_LINE.match(line.strip())
+                if match and match.group(1).strip():
+                    return match.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
 def log_tail(path, lines=15):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -458,7 +481,8 @@ def status_of(avd: dict, running: dict, states: dict) -> dict:
             launched.pop(name, None)
         else:
             out["status"] = "failed"
-            out["detail"] = f"emulator exited with code {code}"
+            reason = failure_reason(entry["log"])
+            out["detail"] = f"emulator exited with code {code}" + (f": {reason}" if reason else "")
             out["log"] = log_tail(entry["log"])
     return out
 
@@ -498,7 +522,11 @@ def build_command(emulator: str, name: str, port: int, headless=True, wipe=False
     # -no-snapshot-save: every run starts from the same state, whatever the
     # previous run left behind. That is the point of a test device; a farm
     # emulator that quietly carries the last tester's session is not one.
-    cmd = [emulator, "-avd", name, "-port", str(port), "-no-snapshot-save", "-no-boot-anim"]
+    # -no-metrics: emulator 37 prints a consent notice on every launch and says
+    # it will become "a one-time blocking prompt" in a future release. Nobody
+    # is at the console of a farm emulator to answer it.
+    cmd = [emulator, "-avd", name, "-port", str(port), "-no-snapshot-save", "-no-boot-anim",
+           "-no-metrics"]
     if headless:
         cmd.append("-no-window")
     if wipe:

@@ -18,7 +18,8 @@
   완료까지 기다리며, `owner`를 주면 같은 호출에서 점유까지 합니다. `-no-snapshot-save`로 매 실행이
   같은 상태에서 시작하고, 하드웨어 가속 없음 같은 즉시 실패는 에뮬레이터 로그 끝부분과 함께 바로
   돌려줍니다. 남이 점유한 에뮬레이터 종료는 `409`. 서버를 재시작해도 에뮬레이터는 살아 있고, 재시작
-  뒤에는 `adb emu avd name`으로 어느 AVD인지 다시 찾습니다.
+  뒤에는 `adb emu avd name`으로 어느 AVD인지 다시 찾습니다. 실제 Android SDK(emulator 37.2,
+  platform-tools 37.0.1)로 SDK 탐지·AVD 생성/삭제·하드웨어 가속 없음 실패 보고를 확인했습니다.
 - **`/api/devices/occupy`의 `kind`** — `physical`/`virtual`로 실기기나 에뮬레이터만 골라 잡습니다
   (`cli.py occupy --kind`). `/api/devices`에는 `virtual`·`avd`, `/api/health`에는 `devices_virtual`과
   SDK 탐지 결과(`virtual`)가 추가됐습니다. SDK가 없어도 상태는 `ok`입니다.

@@ -242,8 +242,12 @@ python cli.py occupy --owner ci-smoke --kind virtual
 - **종료도 점유를 따릅니다.** 남이 잡고 있는 에뮬레이터는 `409`로 거절합니다 — 진행 중인 테스트가 통째로 끊기니까요.
 - **서버를 재시작해도 에뮬레이터는 살아 있습니다.** 별도 세션/프로세스 그룹으로 띄워서 `Ctrl+C`가 전파되지 않습니다.
   재시작 뒤에도 adb(`emu avd name`)로 어느 AVD가 돌고 있는지 다시 알아냅니다.
-- **바로 죽으면 바로 알려줍니다.** 하드웨어 가속 없음·엔진 누락 같은 흔한 실패는 1~2초 안에 프로세스가 끝나므로,
-  시작 응답이 에뮬레이터 로그 마지막 줄과 함께 실패를 돌려줍니다. 전체 로그는 `logs/emulator_<AVD>.log`.
+- **바로 죽으면 바로 알려줍니다.** 하드웨어 가속 없음·엔진 누락 같은 흔한 실패는 adb에 등록되기 전에 프로세스가
+  끝납니다. 시작 응답은 죽거나 adb에 잡힐 때까지(최대 15초) 기다렸다가, 실패면 에뮬레이터의 `ERROR` 줄을 메시지에
+  담고 로그 끝부분과 함께 돌려줍니다. 예: `Emulator exited immediately (code 1): x86_64 emulation currently
+  requires hardware acceleration!` 전체 로그는 `logs/emulator_<AVD>.log`.
+- **`-no-metrics`로 띄웁니다.** emulator 37은 매번 사용 통계 동의 안내를 출력하고, 향후 버전에서 입력을 기다리는
+  프롬프트로 바뀐다고 예고합니다. 창 없는 팜 에뮬레이터에는 대답할 사람이 없습니다.
 
 기기 별칭을 미리 넣어두려면 `device_aliases.example.json`을 `device_aliases.json`으로 복사해서 편집하세요. 이 파일은 실기기 시리얼이 들어가므로 gitignore되어 있습니다.
 
